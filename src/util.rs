@@ -275,30 +275,6 @@ where
     Box::pin(out_stream)
 }
 
-/// Settings that the session which *plans* a query must carry.
-///
-/// DataFusion 55 has operators publish dynamic filters to the scans below them,
-/// coordinated across the partitions of a plan. `SharedBuildAccumulator` for a
-/// `CollectLeft` hash join, for instance, waits for `collect_build_side` to be
-/// called once per output partition before it publishes the filter and wakes
-/// the partitions parked in `wait_for_completion`.
-///
-/// `PartitionIsolatorExec` runs only the partitions in a processor's partition
-/// group, so the masked-out partitions never report and that count is never
-/// reached: the stage deadlocks with every partition parked and no CPU in use.
-///
-/// The filter is planted at plan time and travels inside the serialized plan,
-/// so this has to be set on the planning session, not on the executing ones.
-/// DataFusion 45 had no dynamic filters at all, so turning the whole family off
-/// keeps the pre-rebase behaviour; re-enabling the variants that are safe under
-/// partition isolation is a performance follow-up.
-pub(crate) fn apply_planning_settings(config: &mut SessionConfig) {
-    config
-        .options_mut()
-        .optimizer
-        .enable_dynamic_filter_pushdown = false;
-}
-
 /// Settings that every datafusion-ray session which *executes* a plan must
 /// carry.
 ///
@@ -310,10 +286,27 @@ pub(crate) fn apply_planning_settings(config: &mut SessionConfig) {
 /// entire table and the query would silently return each row once per
 /// processor rather than failing.
 pub(crate) fn apply_execution_settings(config: &mut SessionConfig) {
-    config
-        .options_mut()
-        .execution
-        .enable_file_stream_work_stealing = false;
+    let options = config.options_mut();
+    options.execution.enable_file_stream_work_stealing = false;
+
+    // Same mismatch, second mechanism. A `CollectLeft` hash join publishes a
+    // dynamic filter to the scans below its probe side, coordinated by
+    // `SharedBuildAccumulator`: `collect_build_side` must be called once per
+    // output partition before the last caller is elected to publish the filter
+    // and wake the partitions parked in `wait_for_completion`. The partitions
+    // `PartitionIsolatorExec` masks out never call it, so that count is never
+    // reached and the stage deadlocks with no CPU in use.
+    //
+    // The join reads this flag from the *executing* TaskContext, not from the
+    // session that planned the query.
+    options.optimizer.enable_join_dynamic_filter_pushdown = false;
+    // The TopK and aggregate variants coordinate across partitions the same
+    // way. DataFusion 45 had no dynamic filters at all, so turning the family
+    // off keeps pre-rebase behaviour; re-enabling whichever are safe under
+    // partition isolation is a performance follow-up.
+    options.optimizer.enable_dynamic_filter_pushdown = false;
+    options.optimizer.enable_topk_dynamic_filter_pushdown = false;
+    options.optimizer.enable_aggregate_dynamic_filter_pushdown = false;
 }
 
 pub async fn collect_from_stage(

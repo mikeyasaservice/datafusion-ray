@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::dataframe::DFRayDataFrame;
 use crate::physical::RayStageOptimizerRule;
-use crate::util::{ResultExt, apply_planning_settings, maybe_register_object_store};
+use crate::util::{ResultExt, maybe_register_object_store};
 
 /// Internal Session Context object for the python class DFRayContext
 #[pyclass]
@@ -42,8 +42,7 @@ impl DFRayContext {
     pub fn new() -> PyResult<Self> {
         let rule = RayStageOptimizerRule::new();
 
-        let mut config = SessionConfig::default().with_information_schema(true);
-        apply_planning_settings(&mut config);
+        let config = SessionConfig::default().with_information_schema(true);
 
         let state = SessionStateBuilder::new()
             .with_default_features()
