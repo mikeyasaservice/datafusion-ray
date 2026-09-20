@@ -275,6 +275,30 @@ where
     Box::pin(out_stream)
 }
 
+/// Settings that the session which *plans* a query must carry.
+///
+/// DataFusion 55 has operators publish dynamic filters to the scans below them,
+/// coordinated across the partitions of a plan. `SharedBuildAccumulator` for a
+/// `CollectLeft` hash join, for instance, waits for `collect_build_side` to be
+/// called once per output partition before it publishes the filter and wakes
+/// the partitions parked in `wait_for_completion`.
+///
+/// `PartitionIsolatorExec` runs only the partitions in a processor's partition
+/// group, so the masked-out partitions never report and that count is never
+/// reached: the stage deadlocks with every partition parked and no CPU in use.
+///
+/// The filter is planted at plan time and travels inside the serialized plan,
+/// so this has to be set on the planning session, not on the executing ones.
+/// DataFusion 45 had no dynamic filters at all, so turning the whole family off
+/// keeps the pre-rebase behaviour; re-enabling the variants that are safe under
+/// partition isolation is a performance follow-up.
+pub(crate) fn apply_planning_settings(config: &mut SessionConfig) {
+    config
+        .options_mut()
+        .optimizer
+        .enable_dynamic_filter_pushdown = false;
+}
+
 /// Settings that every datafusion-ray session which *executes* a plan must
 /// carry.
 ///
