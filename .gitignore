@@ -7,3 +7,7 @@ venv
 results-sf*
 data
 tpch/tpch-dbgen
+
+# tpch/tpcbench.py run artifacts (written to --output-path, default cwd)
+datafusion-ray-tpch-*.json
+datafusion_ray_tpch_q*_result.txt
