@@ -247,42 +247,41 @@ mod test {
         );
     }
 
-    /// The physical plan is serialized on the driver and rebuilt inside each
-    /// processor, which then executes a single partition of it. A single large
-    /// file is split into byte ranges across partitions, and if those ranges do
-    /// not survive the round trip every processor reads the whole file and
-    /// results are silently multiplied by the processor count.
+    /// The driver serializes the physical plan and every processor rebuilds it
+    /// and executes exactly one partition, never polling the sibling
+    /// partitions. Each partition must therefore read only its own file group.
+    ///
+    /// DataFusion 55 defaults `enable_file_stream_work_stealing` to true, which
+    /// lets sibling partitions share one queue of unopened files. Under that
+    /// default a lone partition drains the whole scan, so every processor reads
+    /// the entire table and the query silently returns each row once per
+    /// processor instead of failing.
     #[tokio::test]
     async fn file_scan_partitioning_survives_round_trip() {
         use datafusion::physical_plan::ExecutionPlanProperties;
         use datafusion::prelude::SessionConfig;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.parquet");
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
 
-        let mut config = SessionConfig::new().with_target_partitions(3);
-        let opts = config.options_mut();
-        // split even a small file, and write many row groups so it can be split
-        opts.set("datafusion.optimizer.repartition_file_min_size", "16")
+        // one file per group, so there is real work for a sibling to steal
+        for i in 0..3 {
+            let path = dir.path().join(format!("part{i}.parquet"));
+            ctx.sql(&format!(
+                "copy (select v as a from generate_series(1, 1000) t(v)) to '{}' \
+                 stored as parquet",
+                path.display()
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
             .unwrap();
-        opts.set("datafusion.execution.parquet.max_row_group_size", "100")
-            .unwrap();
-        let ctx = SessionContext::new_with_config(config);
-
-        ctx.sql(&format!(
-            "copy (select v as a from generate_series(1, 20000) t(v)) to '{}' \
-             stored as parquet",
-            path.display()
-        ))
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+        }
 
         ctx.register_parquet(
             "t",
-            path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
             datafusion::prelude::ParquetReadOptions::default(),
         )
         .await
@@ -296,20 +295,16 @@ mod test {
             .await
             .unwrap();
         let parts = plan.output_partitioning().partition_count();
-        assert!(
-            parts > 1,
-            "test needs a split scan, got {parts} partition(s)"
-        );
+        assert_eq!(parts, 3, "test needs one partition per file");
 
         let bytes = crate::util::physical_plan_to_bytes(plan.clone()).unwrap();
         // a processor rebuilds the plan in a fresh session, as
-        // DFRayProcessorService::update_plan does, and executes it under a
-        // second session built by configure_ctx
+        // DFRayProcessorService::update_plan does, then executes it under a
+        // session built the way configure_ctx builds one
         let decode_ctx = SessionContext::new();
-        let round_tripped = crate::util::bytes_to_physical_plan(&decode_ctx, &bytes).unwrap();
-        let exec_ctx = SessionContext::new();
-        crate::util::register_object_store_for_paths_in_plan(&exec_ctx, round_tripped.clone())
-            .unwrap();
+        let mut exec_config = SessionConfig::new();
+        crate::util::apply_execution_settings(&mut exec_config);
+        let exec_ctx = SessionContext::new_with_config(exec_config);
 
         let count = async |p: &Arc<dyn ExecutionPlan>, part: usize, c: &SessionContext| -> usize {
             let mut s = p.execute(part, c.task_ctx()).unwrap();
@@ -320,17 +315,19 @@ mod test {
             n
         };
 
-        let mut before = vec![];
-        let mut after = vec![];
         for part in 0..parts {
-            before.push(count(&plan, part, &ctx).await);
-            after.push(count(&round_tripped, part, &exec_ctx).await);
-        }
+            let expected = count(&plan, part, &ctx).await;
+            assert_eq!(expected, 1000, "sanity: one file per partition");
 
-        assert_eq!(before.iter().sum::<usize>(), 20000, "sanity: local plan");
-        assert_eq!(
-            after, before,
-            "per-partition row counts changed across the proto round trip"
-        );
+            // each processor gets its own copy of the plan and runs one
+            // partition of it, in isolation
+            let solo = crate::util::bytes_to_physical_plan(&decode_ctx, &bytes).unwrap();
+            crate::util::register_object_store_for_paths_in_plan(&exec_ctx, solo.clone()).unwrap();
+            assert_eq!(
+                count(&solo, part, &exec_ctx).await,
+                expected,
+                "partition {part} read a different amount when executed on its own"
+            );
+        }
     }
 }

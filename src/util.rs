@@ -275,6 +275,23 @@ where
     Box::pin(out_stream)
 }
 
+/// Settings that every datafusion-ray session which *executes* a plan must
+/// carry.
+///
+/// DataFusion 55 defaults `enable_file_stream_work_stealing` to true, letting
+/// sibling partitions of a file scan share one queue of unopened files. That
+/// assumes all partitions are polled in the same process. We run one partition
+/// per processor on its own copy of the plan and never poll the siblings, so a
+/// lone partition would drain the whole queue: every processor would read the
+/// entire table and the query would silently return each row once per
+/// processor rather than failing.
+pub(crate) fn apply_execution_settings(config: &mut SessionConfig) {
+    config
+        .options_mut()
+        .execution
+        .enable_file_stream_work_stealing = false;
+}
+
 pub async fn collect_from_stage(
     stage_id: usize,
     partition: usize,
@@ -286,7 +303,8 @@ pub async fn collect_from_stage(
     let client = make_client(stage_addr).await?;
 
     client_map.insert((stage_id, partition), Mutex::new(vec![client]));
-    let config = SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map)));
+    let mut config = SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map)));
+    apply_execution_settings(&mut config);
 
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -613,5 +631,20 @@ mod test {
         assert_eq!(batches[6].as_ref().unwrap().num_rows(), 3);
         assert_eq!(batches[7].as_ref().unwrap().num_rows(), 3);
         assert_eq!(batches[8].as_ref().unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn execution_sessions_disable_file_stream_work_stealing() {
+        // Regression guard: with DataFusion 55's default a processor executing
+        // a single partition drains the whole file-scan queue, so every
+        // processor reads the entire table and query results are silently
+        // multiplied by the processor count.
+        let mut config = SessionConfig::new();
+        assert!(
+            config.options().execution.enable_file_stream_work_stealing,
+            "DataFusion no longer defaults this on; revisit apply_execution_settings"
+        );
+        apply_execution_settings(&mut config);
+        assert!(!config.options().execution.enable_file_stream_work_stealing);
     }
 }

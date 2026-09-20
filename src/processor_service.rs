@@ -51,8 +51,9 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use crate::flight::{FlightHandler, FlightServ};
 use crate::isolator::PartitionGroup;
 use crate::util::{
-    ResultExt, bytes_to_physical_plan, display_plan_with_partition_counts, extract_ticket,
-    input_stage_ids, make_client, register_object_store_for_paths_in_plan,
+    ResultExt, apply_execution_settings, bytes_to_physical_plan,
+    display_plan_with_partition_counts, extract_ticket, input_stage_ids, make_client,
+    register_object_store_for_paths_in_plan,
 };
 
 /// a map of stage_id, partition to a list FlightClients that can serve
@@ -157,6 +158,8 @@ impl DFRayProcessorHandlerInner {
         // this only matters if the plan includes an PartitionIsolatorExec, which looks for this
         // for this extension and will be ignored otherwise
         config = config.with_extension(Arc::new(PartitionGroup(partition_group.clone())));
+
+        apply_execution_settings(&mut config);
 
         let state = SessionStateBuilder::new()
             .with_default_features()
