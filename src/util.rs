@@ -275,6 +275,34 @@ where
     Box::pin(out_stream)
 }
 
+/// Settings that the session which *plans* a query must carry.
+///
+/// Both of these keep DataFusion 55 from choosing plan shapes that assume every
+/// partition of a plan is executed in one process, which is not how stages run
+/// here — `PartitionIsolatorExec` gives each processor only its partition group.
+///
+/// * `CollectLeft` hash joins broadcast the build side and emit the left-side
+///   rows of a semi/anti/outer join only from the probe partition that finishes
+///   last (`probe_threads_counter` reaching zero in
+///   `hash_join::exec::report_probe_completed`). A processor never runs the
+///   whole probe side, so that never happens and the join yields nothing —
+///   TPC-H q4 came back empty. Zeroing the thresholds forces `Partitioned`
+///   joins, where each partition builds its own side and emits independently.
+/// * Uncorrelated scalar subqueries are planned as a `ScalarSubqueryExec`
+///   wrapping a `ScalarSubqueryExpr`. Stage splitting separates them, and the
+///   expression then fails to deserialize ("can only be deserialized as part of
+///   a surrounding ScalarSubqueryExec") — TPC-H q11. DataFusion documents this
+///   flag as an escape hatch for exactly this case; turning it off restores the
+///   rewrite-to-join behaviour that DataFusion 45 used.
+pub(crate) fn apply_planning_settings(config: &mut SessionConfig) {
+    let options = config.options_mut();
+    options.optimizer.hash_join_single_partition_threshold = 0;
+    options.optimizer.hash_join_single_partition_threshold_rows = 0;
+    options
+        .optimizer
+        .enable_physical_uncorrelated_scalar_subquery = false;
+}
+
 /// Settings that every datafusion-ray session which *executes* a plan must
 /// carry.
 ///
