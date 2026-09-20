@@ -22,8 +22,7 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-// Deprecated in DataFusion 55 in favour of arrow-rs `BatchCoalescer`. Swapping it
-// out would change batching behaviour, which is out of scope for a version rebase.
+// see coalesce_batches() below for why this deprecated operator is still used
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::displayable;
@@ -88,7 +87,6 @@ impl DFRayDataFrame {
 #[pymethods]
 impl DFRayDataFrame {
     #[pyo3(signature = (batch_size, prefetch_buffer_size, partitions_per_worker=None))]
-    #[allow(deprecated)]
     fn stages(
         &mut self,
         py: Python,
@@ -167,8 +165,7 @@ impl DFRayDataFrame {
                 trace!("nested join output partitioning {}", partition_count);
 
                 replacement = Arc::new(MaxRowsExec::new(
-                    Arc::new(CoalesceBatchesExec::new(replacement, batch_size))
-                        as Arc<dyn ExecutionPlan>,
+                    coalesce_batches(replacement, batch_size),
                     batch_size,
                 )) as Arc<dyn ExecutionPlan>;
 
@@ -203,8 +200,7 @@ impl DFRayDataFrame {
         last_stage = PyDFRayStage::new(
             last_stage.stage_id,
             Arc::new(MaxRowsExec::new(
-                Arc::new(CoalesceBatchesExec::new(last_stage.plan, batch_size))
-                    as Arc<dyn ExecutionPlan>,
+                coalesce_batches(last_stage.plan, batch_size),
                 batch_size,
             )) as Arc<dyn ExecutionPlan>,
             vec![vec![0]],
@@ -266,8 +262,18 @@ impl DFRayDataFrame {
     }
 }
 
-#[allow(clippy::type_complexity)]
+/// DataFusion deprecated `CoalesceBatchesExec` in 52.0 in favour of arrow-rs's
+/// `BatchCoalescer`, but there is no replacement *operator*: `BatchCoalescer`
+/// is a stream-level utility used inside operators such as `FilterExec`, while
+/// we assemble stages as plan trees and need a node. DataFusion still builds
+/// this node itself and its proto codec still round-trips it, so we keep using
+/// it and contain the deprecation to this one call.
 #[allow(deprecated)]
+fn coalesce_batches(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Arc<dyn ExecutionPlan> {
+    Arc::new(CoalesceBatchesExec::new(input, batch_size)) as Arc<dyn ExecutionPlan>
+}
+
+#[allow(clippy::type_complexity)]
 fn build_replacement(
     plan: Arc<dyn ExecutionPlan>,
     prefetch_buffer_size: usize,
@@ -307,7 +313,7 @@ fn build_replacement(
     // insert a coalescing batches here too so that we aren't sending
     // too small (or too big) of batches over the network
     replacement = Arc::new(MaxRowsExec::new(
-        Arc::new(CoalesceBatchesExec::new(replacement, inner_batch_size)) as Arc<dyn ExecutionPlan>,
+        coalesce_batches(replacement, inner_batch_size),
         max_rows,
     )) as Arc<dyn ExecutionPlan>;
 
