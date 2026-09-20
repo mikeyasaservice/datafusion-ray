@@ -30,6 +30,7 @@ pub mod flight;
 pub mod isolator;
 pub mod max_rows;
 pub mod physical;
+pub mod pyerr;
 pub mod pre_fetch;
 pub mod processor_service;
 pub mod stage;
@@ -44,6 +45,8 @@ fn _datafusion_ray_internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dataframe::PyDFRayStage>()?;
     m.add_class::<processor_service::DFRayProcessorService>()?;
     m.add_class::<util::LocalValidator>()?;
+    m.add_class::<pyerr::PyExecutionPlan>()?;
+    m.add_class::<pyerr::PyLogicalPlan>()?;
     m.add_function(wrap_pyfunction!(util::prettify, m)?)?;
     Ok(())
 }
