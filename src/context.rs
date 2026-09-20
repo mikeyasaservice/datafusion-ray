@@ -19,7 +19,8 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionConfig, SessionContext};
-use datafusion_python::utils::wait_for_future;
+use datafusion_python::errors::PyDataFusionResult;
+use datafusion_python_util::wait_for_future;
 use log::debug;
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -54,7 +55,12 @@ impl DFRayContext {
         Ok(Self { ctx })
     }
 
-    pub fn register_parquet(&self, py: Python, name: String, path: String) -> PyResult<()> {
+    pub fn register_parquet(
+        &self,
+        py: Python,
+        name: String,
+        path: String,
+    ) -> PyDataFusionResult<()> {
         let options = ParquetReadOptions::default();
 
         let url = ListingTableUrl::parse(&path).to_py_err()?;
@@ -62,11 +68,16 @@ impl DFRayContext {
         maybe_register_object_store(&self.ctx, url.as_ref()).to_py_err()?;
         debug!("register_parquet: registering table {} at {}", name, path);
 
-        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))?;
+        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))??;
         Ok(())
     }
 
-    pub fn register_csv(&self, py: Python, name: String, path: String) -> PyResult<()> {
+    pub fn register_csv(
+        &self,
+        py: Python,
+        name: String,
+        path: String,
+    ) -> PyDataFusionResult<()> {
         let options = CsvReadOptions::default();
 
         let url = ListingTableUrl::parse(&path).to_py_err()?;
@@ -74,7 +85,7 @@ impl DFRayContext {
         maybe_register_object_store(&self.ctx, url.as_ref()).to_py_err()?;
         debug!("register_csv: registering table {} at {}", name, path);
 
-        wait_for_future(py, self.ctx.register_csv(&name, &path, options.clone()))?;
+        wait_for_future(py, self.ctx.register_csv(&name, &path, options.clone()))??;
         Ok(())
     }
 
@@ -85,7 +96,7 @@ impl DFRayContext {
         name: &str,
         path: &str,
         file_extension: &str,
-    ) -> PyResult<()> {
+    ) -> PyDataFusionResult<()> {
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::new())).with_file_extension(file_extension);
 
@@ -102,17 +113,17 @@ impl DFRayContext {
             py,
             self.ctx
                 .register_listing_table(name, path, options, None, None),
-        )
-        .to_py_err()
+        )??;
+        Ok(())
     }
 
-    pub fn sql(&self, py: Python, query: String) -> PyResult<DFRayDataFrame> {
-        let df = wait_for_future(py, self.ctx.sql(&query))?;
+    pub fn sql(&self, py: Python, query: String) -> PyDataFusionResult<DFRayDataFrame> {
+        let df = wait_for_future(py, self.ctx.sql(&query))??;
 
         Ok(DFRayDataFrame::new(df))
     }
 
-    pub fn set(&self, option: String, value: String) -> PyResult<()> {
+    pub fn set(&self, option: String, value: String) -> PyDataFusionResult<()> {
         let state = self.ctx.state_ref();
         let mut guard = state.write();
         let config = guard.config_mut();

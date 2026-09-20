@@ -66,9 +66,9 @@ impl PhysicalOptimizerRule for RayStageOptimizerRule {
         let mut stage_counter = 0;
 
         let up = |plan: Arc<dyn ExecutionPlan>| {
-            if plan.as_any().downcast_ref::<RepartitionExec>().is_some()
-                || plan.as_any().downcast_ref::<SortExec>().is_some()
-                || plan.as_any().downcast_ref::<NestedLoopJoinExec>().is_some()
+            if plan.downcast_ref::<RepartitionExec>().is_some()
+                || plan.downcast_ref::<SortExec>().is_some()
+                || plan.downcast_ref::<NestedLoopJoinExec>().is_some()
             {
                 let stage = Arc::new(DFRayStageExec::new(plan, stage_counter));
                 stage_counter += 1;

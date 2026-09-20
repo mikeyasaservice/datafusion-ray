@@ -1,6 +1,8 @@
 use std::{fmt::Formatter, sync::Arc};
 
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
@@ -19,7 +21,7 @@ pub struct PrefetchExec {
     /// maximum amount of buffered RecordBatches
     pub(crate) buf_size: usize,
     /// our plan Properties, the same as our input
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl PrefetchExec {
@@ -54,14 +56,20 @@ impl ExecutionPlan for PrefetchExec {
         "PrefetchExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // this node owns no physical expressions
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+#[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

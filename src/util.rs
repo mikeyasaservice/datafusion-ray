@@ -22,9 +22,8 @@ use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-use datafusion::datasource::physical_plan::{
-    ArrowExec, AvroExec, CsvExec, NdJsonExec, ParquetExec,
-};
+use datafusion::datasource::physical_plan::{FileScanConfig, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, SessionStateBuilder};
@@ -32,7 +31,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::AsExecutionPlan;
-use datafusion_python::utils::wait_for_future;
+use datafusion_python::errors::PyDataFusionResult;
+use datafusion_python_util::wait_for_future;
 use futures::{Stream, StreamExt};
 use log::debug;
 use object_store::ObjectStore;
@@ -127,7 +127,7 @@ pub fn bytes_to_physical_plan(
     let proto_plan = datafusion_proto::protobuf::PhysicalPlanNode::try_decode(plan_bytes)?;
 
     let codec = RayCodec {};
-    let plan = proto_plan.try_into_physical_plan(ctx, ctx.runtime_env().as_ref(), &codec)?;
+    let plan = proto_plan.try_into_physical_plan(&ctx.task_ctx(), &codec)?;
     Ok(plan)
 }
 
@@ -226,7 +226,7 @@ pub fn input_stage_ids(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<usize>, Data
     let mut result = vec![];
     plan.clone()
         .transform_down(|node: Arc<dyn ExecutionPlan>| {
-            if let Some(reader) = node.as_any().downcast_ref::<DFRayStageReaderExec>() {
+            if let Some(reader) = node.downcast_ref::<DFRayStageReaderExec>() {
                 result.push(reader.stage_id);
             }
             Ok(Transformed::no(node))
@@ -273,25 +273,6 @@ where
     };
 
     Box::pin(out_stream)
-}
-
-/// ParquetExecs do not correctly preserve their options when serialized to substrait.
-/// So we fix it here.
-///
-/// Walk the plan tree and update any ParquetExec nodes to set the options we need.
-/// We'll use this method until we are using a DataFusion version which includes thf
-/// fix https://github.com/apache/datafusion/pull/14465
-pub fn fix_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    Ok(plan
-        .transform_up(|node| {
-            if let Some(parquet) = node.as_any().downcast_ref::<ParquetExec>() {
-                let new_parquet_node = parquet.clone().with_pushdown_filters(true);
-                Ok(Transformed::yes(Arc::new(new_parquet_node)))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?
-        .data)
 }
 
 pub async fn collect_from_stage(
@@ -388,7 +369,10 @@ pub fn display_plan_with_partition_counts(plan: &Arc<dyn ExecutionPlan>) -> impl
 }
 
 fn print_node(plan: &Arc<dyn ExecutionPlan>, indent: usize, output: &mut String) {
-    let extra = if let Some(parquet) = plan.as_any().downcast_ref::<ParquetExec>() {
+    let extra = if let Some((_, parquet)) = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.downcast_to_file_source::<ParquetSource>())
+    {
         &format!(
             " [pushdown filters: {}]",
             parquet.table_parquet_options().global.pushdown_filters
@@ -423,7 +407,12 @@ impl LocalValidator {
         Self { ctx }
     }
 
-    pub fn register_parquet(&self, py: Python, name: String, path: String) -> PyResult<()> {
+    pub fn register_parquet(
+        &self,
+        py: Python,
+        name: String,
+        path: String,
+    ) -> PyDataFusionResult<()> {
         let options = ParquetReadOptions::default();
 
         let url = ListingTableUrl::parse(&path).to_py_err()?;
@@ -431,7 +420,7 @@ impl LocalValidator {
         maybe_register_object_store(&self.ctx, url.as_ref()).to_py_err()?;
         debug!("register_parquet: registering table {} at {}", name, path);
 
-        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))?;
+        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))??;
         Ok(())
     }
 
@@ -442,7 +431,7 @@ impl LocalValidator {
         name: &str,
         path: &str,
         file_extension: &str,
-    ) -> PyResult<()> {
+    ) -> PyDataFusionResult<()> {
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::new())).with_file_extension(file_extension);
 
@@ -459,12 +448,12 @@ impl LocalValidator {
             py,
             self.ctx
                 .register_listing_table(name, path, options, None, None),
-        )
-        .to_py_err()
+        )??;
+        Ok(())
     }
 
     #[pyo3(signature = (query))]
-    fn collect_sql(&self, py: Python, query: String) -> PyResult<PyObject> {
+    fn collect_sql(&self, py: Python, query: String) -> PyDataFusionResult<PyObject> {
         let fut = async || {
             let df = self.ctx.sql(&query).await?;
             let batches = df.collect().await?;
@@ -472,8 +461,7 @@ impl LocalValidator {
             Ok::<_, DataFusionError>(batches)
         };
 
-        let batches = wait_for_future(py, fut())
-            .to_py_err()?
+        let batches = wait_for_future(py, fut())??
             .iter()
             .map(|batch| batch.to_pyarrow(py))
             .collect::<PyResult<Vec<_>>>()?;
@@ -489,21 +477,10 @@ pub(crate) fn register_object_store_for_paths_in_plan(
 ) -> Result<(), DataFusionError> {
     let check_plan = |plan: Arc<dyn ExecutionPlan>| -> Result<_, DataFusionError> {
         for input in plan.children().into_iter() {
-            if let Some(node) = input.as_any().downcast_ref::<ParquetExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<CsvExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<NdJsonExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<AvroExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<ArrowExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
+            if let Some(scan) = input.downcast_ref::<DataSourceExec>() {
+                if let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>() {
+                    maybe_register_object_store(ctx, config.object_store_url.as_ref())?
+                }
             }
         }
         Ok(Transformed::no(plan))

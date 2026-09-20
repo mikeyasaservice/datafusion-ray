@@ -28,7 +28,8 @@ use datafusion::common::internal_datafusion_err;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_python::utils::wait_for_future;
+use datafusion_python::errors::PyDataFusionResult;
+use datafusion_python_util::wait_for_future;
 use futures::{Stream, TryStreamExt};
 use local_ip_address::local_ip;
 use log::{debug, error, info, trace};
@@ -280,7 +281,7 @@ impl DFRayProcessorService {
         let my_local_ip = local_ip().to_py_err()?;
         let my_host_str = format!("{my_local_ip}:0");
 
-        self.listener = Some(wait_for_future(py, TcpListener::bind(&my_host_str)).to_py_err()?);
+        self.listener = Some(wait_for_future(py, TcpListener::bind(&my_host_str))?.to_py_err()?);
 
         self.addr = Some(format!(
             "{}",
@@ -324,7 +325,7 @@ impl DFRayProcessorService {
         stage_addrs: HashMap<usize, HashMap<usize, Vec<String>>>,
         partition_group: Vec<usize>,
         plan_bytes: &[u8],
-    ) -> PyResult<Bound<'a, PyAny>> {
+    ) -> PyDataFusionResult<Bound<'a, PyAny>> {
         let plan = bytes_to_physical_plan(&SessionContext::new(), plan_bytes)?;
 
         debug!(

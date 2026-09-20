@@ -1,9 +1,10 @@
 use std::{fmt::Formatter, sync::Arc};
 
 use arrow_flight::{FlightClient, Ticket};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_datafusion_err, internal_err};
 use datafusion::error::Result;
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -26,7 +27,7 @@ use crate::util::CombinedRecordBatchStream;
 /// and storing it as an extension in the [`datafusion::execution::TaskContext`] configuration.
 #[derive(Debug)]
 pub struct DFRayStageReaderExec {
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     schema: SchemaRef,
     pub stage_id: usize,
 }
@@ -39,12 +40,12 @@ impl DFRayStageReaderExec {
     }
 
     pub fn try_new(partitioning: Partitioning, schema: SchemaRef, stage_id: usize) -> Result<Self> {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(partitioning.partition_count()),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             properties,
@@ -76,14 +77,20 @@ impl ExecutionPlan for DFRayStageReaderExec {
         "RayStageReaderExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // this node owns no physical expressions
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+#[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

@@ -112,10 +112,3 @@ DataFusion for Ray outputs logs from both python and rust, and in order to handl
 ## Status
 
 - DataFusion for Ray can execute all TPCH queries. Tested up to SF100.
-
-## Known Issues
-
-- We are waiting to upgrade to a DataFusion version where the parquet options are serialized into substrait in order to send them correctly in a plan. Currently, we
-  manually add back `table_parquet_options.pushdown_filters=true` after deserialization to compensate. This will be refactored in the future.
-
-see <https://github.com/apache/datafusion/pull/14465>

@@ -1,6 +1,8 @@
 use std::{fmt::Formatter, sync::Arc};
 
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
 
@@ -33,10 +35,10 @@ use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStre
 ///                  HashJoinExec: mode=Partitioned, join_type=Inner, on=[(c_custkey@0, o_custkey@0)], projection=[c_name@1, o_totalprice@3]
 ///                    RayStageExec[0] (output_partitioning=Hash([Column { name: "c_custkey", index: 0 }], 2))
 ///                      RepartitionExec: partitioning=Hash([c_custkey@0], 2), input_partitions=1
-///                        ParquetExec: file_groups={1 group: [[.../customer.parquet]]}, projection=[c_custkey, c_name]
+///                        DataSourceExec: file_groups={1 group: [[.../customer.parquet]]}, projection=[c_custkey, c_name]
 ///                    RayStageExec[1] (output_partitioning=Hash([Column { name: "o_custkey", index: 0 }], 2))
 ///                      RepartitionExec: partitioning=Hash([o_custkey@0], 2), input_partitions=2
-///                        ParquetExec: file_groups={2 groups: [[.../orders.parquet:0..19037604], [.../orders.parquet:19037604..38075207]]}, projection=[o_custkey, o_totalprice]
+///                        DataSourceExec: file_groups={2 groups: [[.../orders.parquet:0..19037604], [.../orders.parquet:19037604..38075207]]}, projection=[o_custkey, o_totalprice]
 /// `
 /// This physical plan will be split into 4 stages, as indicated by the RayStageExec nodes.  Those
 /// stages will look like this:
@@ -47,14 +49,14 @@ use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStre
 ///   CoalesceBatchesExec: target_batch_size=8192
 ///     RepartitionExec: partitioning=Hash([c_custkey@0], 2), input_partitions=1
 ///       PartitionIsolatorExec
-///         ParquetExec: file_groups={1 group: [[.../customer.parquet]]}, projection=[c_custkey, c_name]
+///         DataSourceExec: file_groups={1 group: [[.../customer.parquet]]}, projection=[c_custkey, c_name]
 ///
 /// Stage 1 output partitions:2 shadow partitions: 2
 /// MaxRowsExec[max_rows=8192]
 ///   CoalesceBatchesExec: target_batch_size=8192
 ///     RepartitionExec: partitioning=Hash([o_custkey@0], 2), input_partitions=1
 ///       PartitionIsolatorExec
-///         ParquetExec: file_groups={2 groups: [[.../orders.parquet:0..19037604], [.../orders.parquet:19037604..38075207]]}, projection=[o_custkey, o_totalprice]
+///         DataSourceExec: file_groups={2 groups: [[.../orders.parquet:0..19037604], [.../orders.parquet:19037604..38075207]]}, projection=[o_custkey, o_totalprice]
 ///
 /// Stage 2 output partitions:2 shadow partitions: 2
 /// MaxRowsExec[max_rows=8192]
@@ -83,7 +85,7 @@ pub struct DFRayStageExec {
     /// Input plan
     pub(crate) input: Arc<dyn ExecutionPlan>,
     /// Output partitioning
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     pub stage_id: usize,
 }
 
@@ -101,7 +103,7 @@ impl DFRayStageExec {
     fn new_with_properties(
         input: Arc<dyn ExecutionPlan>,
         stage_id: usize,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     ) -> Self {
         Self {
             input,
@@ -133,14 +135,20 @@ impl ExecutionPlan for DFRayStageExec {
         "RayStageExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // this node owns no physical expressions
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+#[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

@@ -26,15 +26,16 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion::physical_plan::joins::NestedLoopJoinExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::DataFrame;
-use datafusion_python::errors::PyDataFusionError;
+use datafusion_python::errors::{PyDataFusionError, PyDataFusionResult};
 use datafusion_python::physical_plan::PyExecutionPlan;
 use datafusion_python::sql::logical::PyLogicalPlan;
-use datafusion_python::utils::wait_for_future;
+use datafusion_python_util::wait_for_future;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use log::trace;
@@ -50,7 +51,6 @@ use crate::max_rows::MaxRowsExec;
 use crate::pre_fetch::PrefetchExec;
 use crate::stage::DFRayStageExec;
 use crate::stage_reader::DFRayStageReaderExec;
-use crate::util::ResultExt;
 use crate::util::collect_from_stage;
 use crate::util::display_plan_with_partition_counts;
 use crate::util::physical_plan_to_bytes;
@@ -93,7 +93,7 @@ impl DFRayDataFrame {
         batch_size: usize,
         prefetch_buffer_size: usize,
         partitions_per_worker: Option<usize>,
-    ) -> PyResult<Vec<PyDFRayStage>> {
+    ) -> PyDataFusionResult<Vec<PyDFRayStage>> {
         let mut stages = vec![];
 
         let mut partition_groups = vec![];
@@ -106,7 +106,7 @@ impl DFRayDataFrame {
                 displayable(plan.as_ref()).one_line()
             );
 
-            if let Some(stage_exec) = plan.as_any().downcast_ref::<DFRayStageExec>() {
+            if let Some(stage_exec) = plan.downcast_ref::<DFRayStageExec>() {
                 trace!("ray stage exec");
                 let input = plan.children();
                 assert!(input.len() == 1, "RayStageExec must have exactly one child");
@@ -129,7 +129,7 @@ impl DFRayDataFrame {
 
                 stages.push(stage);
                 Ok(Transformed::yes(replacement))
-            } else if plan.as_any().downcast_ref::<RepartitionExec>().is_some() {
+            } else if plan.downcast_ref::<RepartitionExec>().is_some() {
                 trace!("repartition exec");
                 let (calculated_partition_groups, replacement) = build_replacement(
                     plan,
@@ -142,7 +142,7 @@ impl DFRayDataFrame {
                 partition_groups = calculated_partition_groups;
 
                 Ok(Transformed::yes(replacement))
-            } else if plan.as_any().downcast_ref::<SortExec>().is_some() {
+            } else if plan.downcast_ref::<SortExec>().is_some() {
                 trace!("sort exec");
                 let (calculated_partition_groups, replacement) = build_replacement(
                     plan,
@@ -156,7 +156,7 @@ impl DFRayDataFrame {
                 full_partitions = true;
 
                 Ok(Transformed::yes(replacement))
-            } else if plan.as_any().downcast_ref::<NestedLoopJoinExec>().is_some() {
+            } else if plan.downcast_ref::<NestedLoopJoinExec>().is_some() {
                 trace!("nested loop join exec");
                 // NestedLoopJoinExec must be on a stage by itself as it materializes the entire left
                 // side of the join and is not suitable to be executed in a partitioned manner.
@@ -183,7 +183,7 @@ impl DFRayDataFrame {
             }
         };
 
-        let physical_plan = wait_for_future(py, self.df.clone().create_physical_plan())?;
+        let physical_plan = wait_for_future(py, self.df.clone().create_physical_plan())??;
 
         physical_plan.transform_up(up)?;
 
@@ -193,7 +193,10 @@ impl DFRayDataFrame {
             .ok_or(internal_datafusion_err!("No stages found"))?;
 
         if last_stage.num_output_partitions() > 1 {
-            return internal_err!("Last stage expected to have one partition").to_py_err();
+            return Err(internal_datafusion_err!(
+                "Last stage expected to have one partition"
+            )
+            .into());
         }
 
         last_stage = PyDFRayStage::new(
@@ -221,13 +224,13 @@ impl DFRayDataFrame {
         Ok(stages)
     }
 
-    fn execution_plan(&self, py: Python) -> PyResult<PyExecutionPlan> {
-        let plan = wait_for_future(py, self.df.clone().create_physical_plan())?;
+    fn execution_plan(&self, py: Python) -> PyDataFusionResult<PyExecutionPlan> {
+        let plan = wait_for_future(py, self.df.clone().create_physical_plan())??;
         Ok(PyExecutionPlan::new(plan))
     }
 
-    fn display_execution_plan(&self, py: Python) -> PyResult<String> {
-        let plan = wait_for_future(py, self.df.clone().create_physical_plan())?;
+    fn display_execution_plan(&self, py: Python) -> PyDataFusionResult<String> {
+        let plan = wait_for_future(py, self.df.clone().create_physical_plan())??;
         Ok(display_plan_with_partition_counts(&plan).to_string())
     }
 
@@ -239,7 +242,7 @@ impl DFRayDataFrame {
         self.df.schema().as_arrow().to_pyarrow(py)
     }
 
-    fn optimized_logical_plan(&self) -> PyResult<PyLogicalPlan> {
+    fn optimized_logical_plan(&self) -> PyDataFusionResult<PyLogicalPlan> {
         Ok(PyLogicalPlan::new(self.df.clone().into_optimized_plan()?))
     }
 
@@ -248,8 +251,8 @@ impl DFRayDataFrame {
         py: Python,
         stage_id: usize,
         stage_addr: &str,
-    ) -> PyResult<PyRecordBatchStream> {
-        wait_for_future(
+    ) -> PyDataFusionResult<PyRecordBatchStream> {
+        let stream = wait_for_future(
             py,
             collect_from_stage(
                 stage_id,
@@ -257,9 +260,8 @@ impl DFRayDataFrame {
                 stage_addr,
                 self.final_plan.take().unwrap().clone(),
             ),
-        )
-        .map(PyRecordBatchStream::new)
-        .to_py_err()
+        )??;
+        Ok(PyRecordBatchStream::new(stream))
     }
 }
 
@@ -298,7 +300,7 @@ fn build_replacement(
             child.clone(),
             partitions_per_worker.unwrap(), // we know it is a Some, here.
         ));
-        replacement = replacement.clone().with_new_children(vec![new_child])?;
+        replacement = replace_children_if_necessary(replacement.clone(), vec![new_child])?;
     }
     // insert a coalescing batches here too so that we aren't sending
     // too small (or too big) of batches over the network
@@ -371,12 +373,12 @@ impl PyDFRayStage {
 
     /// returns the stage ids of that we need to read from in order to execute
     #[getter]
-    pub fn child_stage_ids(&self) -> PyResult<Vec<usize>> {
+    pub fn child_stage_ids(&self) -> PyDataFusionResult<Vec<usize>> {
         let mut result = vec![];
         self.plan
             .clone()
             .transform_down(|node: Arc<dyn ExecutionPlan>| {
-                if let Some(reader) = node.as_any().downcast_ref::<DFRayStageReaderExec>() {
+                if let Some(reader) = node.downcast_ref::<DFRayStageReaderExec>() {
                     result.push(reader.stage_id);
                 }
                 Ok(Transformed::no(node))
@@ -392,7 +394,7 @@ impl PyDFRayStage {
         Ok(display_plan_with_partition_counts(&self.plan).to_string())
     }
 
-    pub fn plan_bytes(&self) -> PyResult<Cow<[u8]>> {
+    pub fn plan_bytes(&self) -> PyDataFusionResult<Cow<[u8]>> {
         let plan_bytes = physical_plan_to_bytes(self.plan.clone())?;
         Ok(Cow::Owned(plan_bytes))
     }
@@ -436,7 +438,7 @@ impl PyRecordBatchStream {
 impl PyRecordBatchStream {
     fn next(&mut self, py: Python) -> PyResult<PyObject> {
         let stream = self.stream.clone();
-        wait_for_future(py, next_stream(stream, true)).and_then(|b| b.to_pyarrow(py))
+        wait_for_future(py, next_stream(stream, true))?.and_then(|b| b.to_pyarrow(py))
     }
 
     fn __next__(&mut self, py: Python) -> PyResult<PyObject> {

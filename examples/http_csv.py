@@ -16,7 +16,7 @@
 # under the License.
 
 # this is a port of the example at
-# https://github.com/apache/datafusion/blob/45.0.0/datafusion-examples/examples/query-http-csv.rs
+# https://github.com/apache/datafusion/blob/55.1.0/datafusion-examples/examples/query-http-csv.rs
 
 import ray
 

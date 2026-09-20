@@ -2,7 +2,9 @@ use std::{fmt::Formatter, sync::Arc};
 
 use datafusion::{
     common::internal_datafusion_err,
+    common::tree_node::TreeNodeRecursion,
     error::Result,
+    physical_expr::PhysicalExpr,
     execution::SendableRecordBatchStream,
     physical_plan::{
         DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
@@ -23,17 +25,17 @@ pub struct PartitionGroup(pub Vec<usize>);
 #[derive(Debug)]
 pub struct PartitionIsolatorExec {
     pub input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     pub partition_count: usize,
 }
 
 impl PartitionIsolatorExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, partition_count: usize) -> Self {
         // We advertise that we only have partition_count partitions
-        let properties = input
-            .properties()
-            .clone()
-            .with_partitioning(Partitioning::UnknownPartitioning(partition_count));
+        let properties = Arc::new(
+            PlanProperties::clone(input.properties())
+                .with_partitioning(Partitioning::UnknownPartitioning(partition_count)),
+        );
 
         Self {
             input,
@@ -58,11 +60,8 @@ impl ExecutionPlan for PartitionIsolatorExec {
         "PartitionIsolatorExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -70,6 +69,15 @@ impl ExecutionPlan for PartitionIsolatorExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // this node owns no physical expressions
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+#[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

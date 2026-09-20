@@ -13,12 +13,12 @@ use arrow::datatypes::Schema;
 use datafusion::{
     common::{internal_datafusion_err, internal_err},
     error::Result,
-    execution::FunctionRegistry,
+    execution::TaskContext,
     physical_plan::ExecutionPlan,
 };
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, from_proto::parse_protobuf_partitioning,
-    to_proto::serialize_partitioning,
+    PhysicalExtensionCodec, PhysicalPlanDecodeContext, PhysicalProtoConverterExtension,
+    from_proto::parse_protobuf_partitioning, to_proto::serialize_partitioning,
 };
 use datafusion_proto::protobuf;
 
@@ -35,7 +35,8 @@ impl PhysicalExtensionCodec for RayCodec {
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
-        registry: &dyn FunctionRegistry,
+        ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // TODO: clean this up
         if let Ok(node) = PartitionIsolatorExecNode::decode(buf) {
@@ -56,11 +57,12 @@ impl PhysicalExtensionCodec for RayCodec {
                 .ok_or(internal_datafusion_err!("missing schema in proto"))?
                 .try_into()?;
 
+            let decode_ctx = PhysicalPlanDecodeContext::new(ctx, self);
             let part = parse_protobuf_partitioning(
                 node.partitioning.as_ref(),
-                registry,
+                &decode_ctx,
                 &schema,
-                &DefaultPhysicalExtensionCodec {},
+                proto_converter,
             )?
             .ok_or(internal_datafusion_err!("missing partitioning in proto"))?;
 
@@ -98,12 +100,18 @@ impl PhysicalExtensionCodec for RayCodec {
         }
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        if let Some(reader) = node.as_any().downcast_ref::<DFRayStageReaderExec>() {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
+        if let Some(reader) = node.downcast_ref::<DFRayStageReaderExec>() {
             let schema: protobuf::Schema = reader.schema().try_into()?;
             let partitioning: protobuf::Partitioning = serialize_partitioning(
                 reader.properties().output_partitioning(),
-                &DefaultPhysicalExtensionCodec {},
+                self,
+                proto_converter,
             )?;
 
             let pb = DfRayStageReaderExecNode {
@@ -115,7 +123,7 @@ impl PhysicalExtensionCodec for RayCodec {
             pb.encode(buf)
                 .map_err(|e| internal_datafusion_err!("can't encode ray stage reader pb: {e}"))?;
             Ok(())
-        } else if let Some(pi) = node.as_any().downcast_ref::<PartitionIsolatorExec>() {
+        } else if let Some(pi) = node.downcast_ref::<PartitionIsolatorExec>() {
             let pb = PartitionIsolatorExecNode {
                 dummy: 0.0,
                 partition_count: pi.partition_count as u64,
@@ -125,7 +133,7 @@ impl PhysicalExtensionCodec for RayCodec {
                 .map_err(|e| internal_datafusion_err!("can't encode partition isolator pb: {e}"))?;
 
             Ok(())
-        } else if let Some(max) = node.as_any().downcast_ref::<MaxRowsExec>() {
+        } else if let Some(max) = node.downcast_ref::<MaxRowsExec>() {
             let pb = MaxRowsExecNode {
                 max_rows: max.max_rows as u64,
             };
@@ -133,7 +141,7 @@ impl PhysicalExtensionCodec for RayCodec {
                 .map_err(|e| internal_datafusion_err!("can't encode max rows pb: {e}"))?;
 
             Ok(())
-        } else if let Some(pre) = node.as_any().downcast_ref::<PrefetchExec>() {
+        } else if let Some(pre) = node.downcast_ref::<PrefetchExec>() {
             let pb = PrefetchExecNode {
                 dummy: 0,
                 buf_size: pre.buf_size as u64,
@@ -157,7 +165,7 @@ mod test {
         physical_plan::{Partitioning, display::DisplayableExecutionPlan, displayable},
         prelude::SessionContext,
     };
-    use datafusion_proto::physical_plan::AsExecutionPlan;
+    use datafusion_proto::physical_plan::{AsExecutionPlan, DefaultPhysicalProtoConverter};
 
     use std::sync::Arc;
 
@@ -171,9 +179,14 @@ mod test {
         let part = Partitioning::UnknownPartitioning(2);
         let exec = Arc::new(DFRayStageReaderExec::try_new(part, schema, 1).unwrap());
         let codec = RayCodec {};
+        let converter = DefaultPhysicalProtoConverter {};
         let mut buf = vec![];
-        codec.try_encode(exec.clone(), &mut buf).unwrap();
-        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        codec
+            .try_encode(exec.clone(), &mut buf, &converter)
+            .unwrap();
+        let decoded = codec
+            .try_decode(&buf, &[], &ctx.task_ctx(), &converter)
+            .unwrap();
         assert_eq!(exec.schema(), decoded.schema());
     }
     #[test]
@@ -196,9 +209,8 @@ mod test {
                 .expect("to proto");
 
         // deserialize proto back to execution plan
-        let runtime = ctx.runtime_env();
         let result_exec_plan: Arc<dyn ExecutionPlan> = proto
-            .try_into_physical_plan(&ctx, runtime.as_ref(), &codec)
+            .try_into_physical_plan(&ctx.task_ctx(), &codec)
             .expect("from proto");
 
         let input = displayable(exec.as_ref()).indent(true).to_string();
