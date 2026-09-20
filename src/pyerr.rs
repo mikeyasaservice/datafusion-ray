@@ -207,3 +207,45 @@ impl PyLogicalPlan {
         self.display_indent()
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+
+    /// Also the canary for the build setup: this is the first test to touch a
+    /// pyo3 type, so it only links if `--no-default-features` really did turn
+    /// `extension-module` off and libpython is available.
+    #[test]
+    fn plan_wrappers_render_under_python() {
+        let rt = get_tokio_runtime();
+        let plan = rt.block_on(async {
+            let ctx = SessionContext::new();
+            ctx.sql("select 1 as a")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap()
+        });
+
+        Python::attach(|_py| {
+            let p = PyExecutionPlan::new(plan.clone());
+            assert!(p.display().contains("ProjectionExec"));
+            assert!(p.display_indent().contains("ProjectionExec"));
+            assert_eq!(p.partition_count(), 1);
+            assert!(p.children().len() == 1);
+            assert_eq!(p.__repr__(), p.display_indent());
+        });
+    }
+
+    #[test]
+    fn errors_convert_to_python_exceptions() {
+        let e = PyDataFusionError::from(DataFusionError::Internal("boom".into()));
+        assert!(e.to_string().contains("boom"));
+        Python::attach(|_py| {
+            let py_err: PyErr = e.into();
+            assert!(py_err.to_string().contains("boom"));
+        });
+    }
+}
