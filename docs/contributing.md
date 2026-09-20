@@ -112,3 +112,25 @@ DataFusion for Ray outputs logs from both python and rust, and in order to handl
 ## Status
 
 - DataFusion for Ray can execute all TPCH queries. Tested up to SF100.
+
+## Known Issues
+
+DataFusion assumes in several places that every partition of a plan is executed in
+one process. Stages here are split across processors and `PartitionIsolatorExec`
+gives each one only its partition group, so those code paths have to be turned off.
+They are collected in `apply_planning_settings` and `apply_execution_settings` in
+`src/util.rs`, each with a comment explaining what breaks without it.
+
+None of them fail to compile and none are caught by the unit tests: the failure
+modes are wrong results, empty results and deadlocks. The TPC-H validation run is
+what catches them, so run it after any DataFusion upgrade:
+
+```shell
+python tpch/make_data.py 1 testdata/tpch/
+python tpch/tpcbench.py --data="file://$PWD/testdata/tpch/" --concurrency 3 \
+  --partitions-per-processor 2 --batch-size=8192 --processor-pool-min=20 --validate
+```
+
+`--partitions-per-processor` must be smaller than `--concurrency` for this to be a
+real test; when they are equal only one processor serves each stage, no isolator is
+inserted, and every one of these bugs is invisible.
