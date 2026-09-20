@@ -181,12 +181,7 @@ fn make_stream(
     let stream = inner
         .plan
         .execute(partition, task_ctx)
-        .inspect_err(|e| {
-            error!(
-                "{}",
-                format!("Could not get partition stream from plan {e}")
-            )
-        })
+        .inspect_err(|e| error!("Could not get partition stream from plan {e}"))
         .map_err(|e| Status::internal(format!("Could not get partition stream from plan {e}")))?
         .map_err(|e| FlightError::from_external_error(Box::new(e)));
 
@@ -352,7 +347,7 @@ impl DFRayProcessorService {
             Ok(())
         };
 
-        pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        Ok(pyo3_async_runtimes::tokio::future_into_py(py, fut)?)
     }
 
     /// start the service

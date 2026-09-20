@@ -87,7 +87,7 @@ pub fn batch_to_ipc(py: Python, batch: PyArrowType<RecordBatch>) -> PyResult<Py<
 }
 
 #[pyfunction]
-pub fn ipc_to_batch(bytes: &[u8], py: Python) -> PyResult<PyObject> {
+pub fn ipc_to_batch<'py>(bytes: &[u8], py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let batch = ipc_to_batch_helper(bytes).to_py_err()?;
     batch.to_pyarrow(py)
 }
@@ -453,7 +453,7 @@ impl LocalValidator {
     }
 
     #[pyo3(signature = (query))]
-    fn collect_sql(&self, py: Python, query: String) -> PyDataFusionResult<PyObject> {
+    fn collect_sql(&self, py: Python, query: String) -> PyDataFusionResult<Py<PyAny>> {
         let fut = async || {
             let df = self.ctx.sql(&query).await?;
             let batches = df.collect().await?;
@@ -477,10 +477,10 @@ pub(crate) fn register_object_store_for_paths_in_plan(
 ) -> Result<(), DataFusionError> {
     let check_plan = |plan: Arc<dyn ExecutionPlan>| -> Result<_, DataFusionError> {
         for input in plan.children().into_iter() {
-            if let Some(scan) = input.downcast_ref::<DataSourceExec>() {
-                if let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>() {
-                    maybe_register_object_store(ctx, config.object_store_url.as_ref())?
-                }
+            if let Some(scan) = input.downcast_ref::<DataSourceExec>()
+                && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+            {
+                maybe_register_object_store(ctx, config.object_store_url.as_ref())?
             }
         }
         Ok(Transformed::no(plan))
@@ -564,7 +564,7 @@ mod test {
         array::Int32Array,
         datatypes::{DataType, Field, Schema},
     };
-    
+
     use futures::stream;
 
     use super::*;
@@ -584,9 +584,10 @@ mod test {
     #[tokio::test]
     async fn test_max_rows_stream() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3, 4, 5, 6, 7, 8,
-        ]))])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]))],
+        )
         .unwrap();
 
         // 24 total rows

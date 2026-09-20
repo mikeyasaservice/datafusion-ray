@@ -11,8 +11,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use datafusion::{arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream};
-use futures::stream::TryStreamExt;
 use futures::StreamExt;
+use futures::stream::TryStreamExt;
 use log::trace;
 use prost::Message;
 
@@ -77,7 +77,6 @@ impl ExecutionPlan for DFRayStageReaderExec {
         "RayStageReaderExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -90,7 +89,7 @@ impl ExecutionPlan for DFRayStageReaderExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-#[allow(deprecated)]
+    #[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

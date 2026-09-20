@@ -135,7 +135,6 @@ impl ExecutionPlan for DFRayStageExec {
         "RayStageExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -148,7 +147,7 @@ impl ExecutionPlan for DFRayStageExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-#[allow(deprecated)]
+    #[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

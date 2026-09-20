@@ -3,8 +3,8 @@ use std::{fmt::Formatter, sync::Arc};
 use datafusion::{
     common::tree_node::TreeNodeRecursion,
     error::Result,
-    physical_expr::PhysicalExpr,
     execution::SendableRecordBatchStream,
+    physical_expr::PhysicalExpr,
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties},
 };
 
@@ -38,7 +38,6 @@ impl ExecutionPlan for MaxRowsExec {
         "MaxRowsExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
@@ -55,7 +54,7 @@ impl ExecutionPlan for MaxRowsExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-#[allow(deprecated)]
+    #[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

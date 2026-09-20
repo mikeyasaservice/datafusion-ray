@@ -18,12 +18,13 @@
 use arrow::array::RecordBatch;
 use arrow::pyarrow::ToPyArrow;
 use datafusion::common::internal_datafusion_err;
-use datafusion::common::internal_err;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::tree_node::TreeNode;
-use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+// Deprecated in DataFusion 55 in favour of arrow-rs `BatchCoalescer`. Swapping it
+// out would change batching behaviour, which is out of scope for a version rebase.
+#[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
@@ -87,6 +88,7 @@ impl DFRayDataFrame {
 #[pymethods]
 impl DFRayDataFrame {
     #[pyo3(signature = (batch_size, prefetch_buffer_size, partitions_per_worker=None))]
+    #[allow(deprecated)]
     fn stages(
         &mut self,
         py: Python,
@@ -193,10 +195,9 @@ impl DFRayDataFrame {
             .ok_or(internal_datafusion_err!("No stages found"))?;
 
         if last_stage.num_output_partitions() > 1 {
-            return Err(internal_datafusion_err!(
-                "Last stage expected to have one partition"
-            )
-            .into());
+            return Err(
+                internal_datafusion_err!("Last stage expected to have one partition").into(),
+            );
         }
 
         last_stage = PyDFRayStage::new(
@@ -238,7 +239,7 @@ impl DFRayDataFrame {
         Ok(PyLogicalPlan::new(self.df.logical_plan().clone()))
     }
 
-    fn schema(&self, py: Python) -> PyResult<PyObject> {
+    fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.df.schema().as_arrow().to_pyarrow(py)
     }
 
@@ -266,6 +267,7 @@ impl DFRayDataFrame {
 }
 
 #[allow(clippy::type_complexity)]
+#[allow(deprecated)]
 fn build_replacement(
     plan: Arc<dyn ExecutionPlan>,
     prefetch_buffer_size: usize,
@@ -394,7 +396,7 @@ impl PyDFRayStage {
         Ok(display_plan_with_partition_counts(&self.plan).to_string())
     }
 
-    pub fn plan_bytes(&self) -> PyDataFusionResult<Cow<[u8]>> {
+    pub fn plan_bytes(&self) -> PyDataFusionResult<Cow<'_, [u8]>> {
         let plan_bytes = physical_plan_to_bytes(self.plan.clone())?;
         Ok(Cow::Owned(plan_bytes))
     }
@@ -410,7 +412,7 @@ pub struct PyRecordBatch {
 
 #[pymethods]
 impl PyRecordBatch {
-    fn to_pyarrow(&self, py: Python) -> PyResult<PyObject> {
+    fn to_pyarrow<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.batch.to_pyarrow(py)
     }
 }
@@ -436,12 +438,12 @@ impl PyRecordBatchStream {
 
 #[pymethods]
 impl PyRecordBatchStream {
-    fn next(&mut self, py: Python) -> PyResult<PyObject> {
+    fn next<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let stream = self.stream.clone();
         wait_for_future(py, next_stream(stream, true))?.and_then(|b| b.to_pyarrow(py))
     }
 
-    fn __next__(&mut self, py: Python) -> PyResult<PyObject> {
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.next(py)
     }
 

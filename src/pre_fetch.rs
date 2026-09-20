@@ -56,7 +56,6 @@ impl ExecutionPlan for PrefetchExec {
         "PrefetchExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -69,7 +68,7 @@ impl ExecutionPlan for PrefetchExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-#[allow(deprecated)]
+    #[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use crate::dataframe::DFRayDataFrame;
 use crate::physical::RayStageOptimizerRule;
-use crate::util::{maybe_register_object_store, ResultExt};
+use crate::util::{ResultExt, maybe_register_object_store};
 
 /// Internal Session Context object for the python class DFRayContext
 #[pyclass]
@@ -72,12 +72,7 @@ impl DFRayContext {
         Ok(())
     }
 
-    pub fn register_csv(
-        &self,
-        py: Python,
-        name: String,
-        path: String,
-    ) -> PyDataFusionResult<()> {
+    pub fn register_csv(&self, py: Python, name: String, path: String) -> PyDataFusionResult<()> {
         let options = CsvReadOptions::default();
 
         let url = ListingTableUrl::parse(&path).to_py_err()?;

@@ -4,8 +4,8 @@ use datafusion::{
     common::internal_datafusion_err,
     common::tree_node::TreeNodeRecursion,
     error::Result,
-    physical_expr::PhysicalExpr,
     execution::SendableRecordBatchStream,
+    physical_expr::PhysicalExpr,
     physical_plan::{
         DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
         PlanProperties,
@@ -60,7 +60,6 @@ impl ExecutionPlan for PartitionIsolatorExec {
         "PartitionIsolatorExec"
     }
 
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -77,7 +76,7 @@ impl ExecutionPlan for PartitionIsolatorExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
-#[allow(deprecated)]
+    #[allow(deprecated)]
     fn with_new_children(
         self: std::sync::Arc<Self>,
         children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
@@ -114,11 +113,10 @@ impl ExecutionPlan for PartitionIsolatorExec {
             ));
         }
 
-        let output_stream = match partition_group.get(partition) {
+        match partition_group.get(partition) {
             Some(actual_partition_number) => self.input.execute(*actual_partition_number, context),
             None => Ok(Box::pin(EmptyRecordBatchStream::new(self.input.schema()))
                 as SendableRecordBatchStream),
-        };
-        output_stream
+        }
     }
 }
