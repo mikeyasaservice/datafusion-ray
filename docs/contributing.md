@@ -109,13 +109,73 @@ DataFusion for Ray's logging output is determined by the `DATAFUSION_RAY_LOG_LEV
 
 DataFusion for Ray outputs logs from both python and rust, and in order to handle this consistently, the python logger for `datafusion_ray` is routed to rust for logging. The `RUST_LOG` environment variable can be used to control other rust log output other than `datafusion_ray`.
 
+## Rust tests
+
+```shell
+cargo test --no-default-features
+```
+
+`--no-default-features` turns off the `extension-module` feature. With it on,
+pyo3 leaves the python symbols to be resolved by the interpreter that loads the
+extension, so the test binary cannot link and every `#[pyclass]`/`#[pymethods]`
+body is out of reach of `cargo test`. `maturin` keeps building with the default
+features, so nothing about the wheel changes.
+
+The tests that hand a `RecordBatch` to python need `pyarrow` importable by the
+interpreter pyo3 links against -- the one `PYO3_PYTHON` names, or whatever
+`python3` resolved to when the crate was built. That is not necessarily the
+project's virtualenv:
+
+```shell
+python3 -m pip install pyarrow   # the interpreter pyo3 links against
+```
+
+Two things to know before adding tests:
+
+- `wait_for_future` runs futures on the crate's global tokio runtime, and
+  `block_on` cannot be called from inside another runtime. Tests that touch the
+  python-facing API are therefore plain `#[test]`s that build their fixtures
+  with an explicit `block_on`, not `#[tokio::test]`s.
+- A `SessionContext` carrying `RayStageOptimizerRule` cannot write its own
+  parquet fixtures: the marker node it plants is `unimplemented!()` to execute.
+  Write fixtures with a plain `SessionContext`.
+
+### Coverage
+
+```shell
+cargo install cargo-llvm-cov
+dev/coverage.py                 # report
+dev/coverage.py --fail-under 85 # what CI gates on
+```
+
+`cargo llvm-cov`'s own summary counts the `#[cfg(test)] mod` blocks inside each
+file as covered lines, so the headline number rises just by writing tests and a
+gate on it could be satisfied by test code counting itself. `dev/coverage.py`
+drops everything from each file's `#[cfg(test)]` line to EOF and reports what is
+left. Keep new test modules at the end of their file so that stays exact.
+
 ## Status
 
 - DataFusion for Ray can execute all TPCH queries. Tested up to SF100.
 
 ## Known Issues
 
-- We are waiting to upgrade to a DataFusion version where the parquet options are serialized into substrait in order to send them correctly in a plan. Currently, we
-  manually add back `table_parquet_options.pushdown_filters=true` after deserialization to compensate. This will be refactored in the future.
+DataFusion assumes in several places that every partition of a plan is executed in
+one process. Stages here are split across processors and `PartitionIsolatorExec`
+gives each one only its partition group, so those code paths have to be turned off.
+They are collected in `apply_planning_settings` and `apply_execution_settings` in
+`src/util.rs`, each with a comment explaining what breaks without it.
 
-see <https://github.com/apache/datafusion/pull/14465>
+None of them fail to compile and none are caught by the unit tests: the failure
+modes are wrong results, empty results and deadlocks. The TPC-H validation run is
+what catches them, so run it after any DataFusion upgrade:
+
+```shell
+python tpch/make_data.py 1 testdata/tpch/
+python tpch/tpcbench.py --data="file://$PWD/testdata/tpch/" --concurrency 3 \
+  --partitions-per-processor 2 --batch-size=8192 --processor-pool-min=20 --validate
+```
+
+`--partitions-per-processor` must be smaller than `--concurrency` for this to be a
+real test; when they are equal only one processor serves each stage, no isolator is
+inserted, and every one of these bugs is invisible.

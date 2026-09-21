@@ -20,6 +20,8 @@ use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::sync::Arc;
 
+use crate::pyerr::PyDataFusionResult;
+use crate::pyerr::wait_for_future;
 use arrow::array::RecordBatch;
 use arrow_flight::FlightClient;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -28,7 +30,6 @@ use datafusion::common::internal_datafusion_err;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_python::utils::wait_for_future;
 use futures::{Stream, TryStreamExt};
 use local_ip_address::local_ip;
 use log::{debug, error, info, trace};
@@ -50,8 +51,9 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use crate::flight::{FlightHandler, FlightServ};
 use crate::isolator::PartitionGroup;
 use crate::util::{
-    ResultExt, bytes_to_physical_plan, display_plan_with_partition_counts, extract_ticket,
-    input_stage_ids, make_client, register_object_store_for_paths_in_plan,
+    ResultExt, apply_execution_settings, bytes_to_physical_plan,
+    display_plan_with_partition_counts, extract_ticket, input_stage_ids, make_client,
+    register_object_store_for_paths_in_plan,
 };
 
 /// a map of stage_id, partition to a list FlightClients that can serve
@@ -157,6 +159,8 @@ impl DFRayProcessorHandlerInner {
         // for this extension and will be ignored otherwise
         config = config.with_extension(Arc::new(PartitionGroup(partition_group.clone())));
 
+        apply_execution_settings(&mut config);
+
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -180,12 +184,7 @@ fn make_stream(
     let stream = inner
         .plan
         .execute(partition, task_ctx)
-        .inspect_err(|e| {
-            error!(
-                "{}",
-                format!("Could not get partition stream from plan {e}")
-            )
-        })
+        .inspect_err(|e| error!("Could not get partition stream from plan {e}"))
         .map_err(|e| Status::internal(format!("Could not get partition stream from plan {e}")))?
         .map_err(|e| FlightError::from_external_error(Box::new(e)));
 
@@ -280,7 +279,7 @@ impl DFRayProcessorService {
         let my_local_ip = local_ip().to_py_err()?;
         let my_host_str = format!("{my_local_ip}:0");
 
-        self.listener = Some(wait_for_future(py, TcpListener::bind(&my_host_str)).to_py_err()?);
+        self.listener = Some(wait_for_future(py, TcpListener::bind(&my_host_str))?.to_py_err()?);
 
         self.addr = Some(format!(
             "{}",
@@ -324,7 +323,7 @@ impl DFRayProcessorService {
         stage_addrs: HashMap<usize, HashMap<usize, Vec<String>>>,
         partition_group: Vec<usize>,
         plan_bytes: &[u8],
-    ) -> PyResult<Bound<'a, PyAny>> {
+    ) -> PyDataFusionResult<Bound<'a, PyAny>> {
         let plan = bytes_to_physical_plan(&SessionContext::new(), plan_bytes)?;
 
         debug!(
@@ -351,7 +350,7 @@ impl DFRayProcessorService {
             Ok(())
         };
 
-        pyo3_async_runtimes::tokio::future_into_py(py, fut)
+        Ok(pyo3_async_runtimes::tokio::future_into_py(py, fut)?)
     }
 
     /// start the service
@@ -394,5 +393,370 @@ impl DFRayProcessorService {
         };
 
         pyo3_async_runtimes::tokio::future_into_py(py, fut)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::flight::FlightServ;
+    use crate::stage_reader::DFRayStageReaderExec;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::Partitioning;
+    use futures::StreamExt;
+    use prost::Message as _;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    /// A leaf plan: no `DFRayStageReaderExec`, so configuring a context for it
+    /// needs no Flight clients and no peers.
+    fn leaf_plan(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let parts: Vec<Vec<RecordBatch>> = (0..partitions)
+            .map(|i| {
+                vec![
+                    RecordBatch::try_new(
+                        schema(),
+                        vec![Arc::new(Int32Array::from(vec![i as i32]))],
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect();
+        MemorySourceConfig::try_new_exec(&parts, schema(), None).unwrap() as Arc<dyn ExecutionPlan>
+    }
+
+    async fn handler_for(plan: Arc<dyn ExecutionPlan>) -> DFRayProcessorHandler {
+        let h = DFRayProcessorHandler::new("[test]".to_string());
+        h.update_plan(0, HashMap::new(), plan, vec![0])
+            .await
+            .unwrap();
+        h
+    }
+
+    fn ticket_for(partition: u64) -> Ticket {
+        Ticket {
+            ticket: crate::protobuf::FlightTicketData {
+                dummy: false,
+                partition,
+            }
+            .encode_to_vec()
+            .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leaf_stage_needs_no_peers() {
+        let ctx =
+            DFRayProcessorHandlerInner::configure_ctx(0, HashMap::new(), leaf_plan(1), vec![0])
+                .await
+                .unwrap();
+
+        // the extensions the plan nodes look for are installed
+        assert!(
+            ctx.state()
+                .config()
+                .get_extension::<ServiceClients>()
+                .is_some()
+        );
+        assert!(
+            ctx.state()
+                .config()
+                .get_extension::<PartitionGroup>()
+                .is_some()
+        );
+        // and the settings that keep partition isolation correct are applied
+        assert!(
+            !ctx.state()
+                .config()
+                .options()
+                .execution
+                .enable_file_stream_work_stealing
+        );
+    }
+
+    /// A stage that reads another one cannot be configured without an address
+    /// for it; that must be a clear error rather than a later hang.
+    #[tokio::test]
+    async fn a_missing_peer_address_is_reported() {
+        let reader = Arc::new(
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(1), schema(), 9)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        match DFRayProcessorHandlerInner::configure_ctx(0, HashMap::new(), reader, vec![0]).await {
+            Err(e) => assert!(e.to_string().contains("Cannot find stage addr"), "got: {e}"),
+            Ok(_) => panic!("stage 9 has no address; expected an error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serving_a_partition_streams_its_rows() {
+        let handler = handler_for(leaf_plan(2)).await;
+        let resp = handler
+            .get_stream(Request::new(ticket_for(1)))
+            .await
+            .unwrap();
+
+        // the response is Flight-encoded, so just assert it carries data
+        let frames: Vec<_> = resp.into_inner().collect().await;
+        assert!(!frames.is_empty(), "expected at least a schema frame");
+        assert!(frames.iter().all(|f| f.is_ok()));
+    }
+
+    /// `make_stream` has to turn a plan-level failure into a Flight status.
+    /// The isolator is used rather than the memory source because the latter
+    /// panics on an out-of-range partition instead of returning an error.
+    #[tokio::test]
+    async fn a_partition_that_does_not_exist_is_an_error() {
+        let isolated = Arc::new(crate::isolator::PartitionIsolatorExec::new(leaf_plan(1), 1))
+            as Arc<dyn ExecutionPlan>;
+        let handler = handler_for(isolated).await;
+        let status = match handler.get_stream(Request::new(ticket_for(99))).await {
+            Err(s) => s,
+            Ok(_) => panic!("partition 99 is out of range; expected an error"),
+        };
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(status.message().contains("partition stream"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_ticket_is_rejected() {
+        let handler = handler_for(leaf_plan(1)).await;
+        let bad = Request::new(Ticket {
+            ticket: vec![0xff, 0xff, 0xff].into(),
+        });
+        let status = match handler.get_stream(bad).await {
+            Err(s) => s,
+            Ok(_) => panic!("garbage ticket; expected an error"),
+        };
+        assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    /// Processors are pooled and reused across queries, so a handler is asked
+    /// for a stream before it has ever been given a plan.
+    #[tokio::test]
+    async fn a_handler_without_a_plan_refuses() {
+        let handler = DFRayProcessorHandler::new("[fresh]".to_string());
+        let status = match handler.get_stream(Request::new(ticket_for(0))).await {
+            Err(s) => s,
+            Ok(_) => panic!("handler has no plan; expected an error"),
+        };
+        assert!(status.message().contains("No inner found"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn updating_the_plan_replaces_what_is_served() {
+        let handler = handler_for(leaf_plan(1)).await;
+        assert!(
+            handler
+                .get_stream(Request::new(ticket_for(0)))
+                .await
+                .is_ok()
+        );
+
+        // a second query reuses the actor with a wider plan
+        handler
+            .update_plan(1, HashMap::new(), leaf_plan(3), vec![0, 1, 2])
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .get_stream(Request::new(ticket_for(2)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_service_has_no_address_until_it_starts_up() {
+        let svc = DFRayProcessorService::new("[svc]".to_string()).unwrap();
+        match svc.addr() {
+            Err(e) => assert!(e.to_string().contains("Couldn't get addr"), "{e:?}"),
+            Ok(a) => panic!("not bound yet, but got {a}"),
+        }
+    }
+
+    /// The whole path a peer actually takes: a tonic server over a real socket,
+    /// reached by a real `FlightClient`.
+    #[tokio::test]
+    async fn a_stage_is_reachable_over_flight() {
+        let handler = Arc::new(handler_for(leaf_plan(2)).await);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(FlightServ { handler }))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+        });
+
+        let mut client = crate::util::make_client(&addr.to_string()).await.unwrap();
+        let stream = client.do_get(ticket_for(0)).await.unwrap();
+        let batches: Vec<_> = stream.collect().await;
+        assert!(!batches.is_empty(), "no batches came back over Flight");
+        assert!(batches.iter().all(|b| b.is_ok()));
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connecting_to_a_bad_address_fails_cleanly() {
+        assert!(crate::util::make_client("not a host:!!").await.is_err());
+    }
+
+    /// Stand a stage up on a real socket. Returns its address and a shutdown
+    /// handle; dropping the sender stops the server.
+    async fn serve(
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let handler = Arc::new(handler_for(plan).await);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(FlightServ { handler }))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+        });
+        (addr, tx, join)
+    }
+
+    /// The consumer half of the same path: a `DFRayStageReaderExec` executed
+    /// against a live peer, which is how every stage but the first gets its
+    /// input and how the driver reads the last one.
+    #[tokio::test]
+    async fn a_reader_pulls_a_partition_from_a_live_stage() {
+        let (addr, shutdown, join) = serve(leaf_plan(2)).await;
+
+        let reader = Arc::new(
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(2), schema(), 0)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        // partition 1 of the fixture holds the single row `1`
+        let stream = crate::util::collect_from_stage(0, 1, &addr, reader)
+            .await
+            .unwrap();
+        let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+        let rows: i32 = batches
+            .into_iter()
+            .map(|b| {
+                let b = b.unwrap();
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum();
+        assert_eq!(rows, 1, "partition 1 should have produced its own row");
+
+        let _ = shutdown.send(());
+        join.await.unwrap().unwrap();
+    }
+
+    /// A peer that goes away mid-query must surface as an error item on the
+    /// stream rather than an empty result that looks like success.
+    #[tokio::test]
+    async fn a_peer_that_has_gone_away_is_reported_on_the_stream() {
+        let (addr, shutdown, join) = serve(leaf_plan(1)).await;
+        let client = crate::util::make_client(&addr).await.unwrap();
+
+        // the connection is established; now take the server away
+        let _ = shutdown.send(());
+        join.await.unwrap().unwrap();
+
+        let mut client_map = HashMap::new();
+        client_map.insert((0, 0), Mutex::new(vec![client]));
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map))),
+        );
+
+        let reader =
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(1), schema(), 0)
+                .unwrap();
+        let out: Vec<_> = reader
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Err(e) => assert!(
+                e.to_string().contains("Error getting flight stream"),
+                "got: {e}"
+            ),
+            Ok(b) => panic!("expected a failure, got {} rows", b.num_rows()),
+        }
+    }
+
+    /// The whole actor lifecycle as ray drives it: bind a socket, take a
+    /// serialized plan, serve it, and stop when told. `serve`, `all_done` and
+    /// `update_plan` all hand python a coroutine, so this drives them from a
+    /// real asyncio loop -- which is also the only way `future_into_py` has a
+    /// loop to attach to.
+    #[test]
+    fn the_service_binds_serves_a_plan_and_shuts_down() {
+        use pyo3::types::{PyBytes, PyModule};
+
+        let plan_bytes = crate::util::physical_plan_to_bytes(leaf_plan(1)).unwrap();
+
+        Python::attach(|py| {
+            let svc = Py::new(py, DFRayProcessorService::new("test".to_string()).unwrap()).unwrap();
+
+            // no socket yet
+            assert!(svc.borrow(py).addr().is_err());
+            svc.borrow_mut(py).start_up(py).unwrap();
+            let addr = svc.borrow(py).addr().unwrap();
+            assert!(addr.contains(':'), "got: {addr}");
+
+            let driver = PyModule::from_code(
+                py,
+                cr#"
+import asyncio
+
+def run(svc, plan_bytes):
+    async def main():
+        await svc.update_plan(0, {}, [0], plan_bytes)
+        serving = asyncio.ensure_future(svc.serve())
+        await asyncio.sleep(0.2)
+        await svc.all_done()
+        await serving
+    asyncio.run(main())
+"#,
+                cr"svc_driver.py",
+                cr"svc_driver",
+            )
+            .unwrap();
+
+            driver
+                .getattr("run")
+                .unwrap()
+                .call1((&svc, PyBytes::new(py, &plan_bytes)))
+                .unwrap();
+        });
     }
 }

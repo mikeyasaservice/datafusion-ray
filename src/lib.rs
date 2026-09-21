@@ -32,6 +32,7 @@ pub mod max_rows;
 pub mod physical;
 pub mod pre_fetch;
 pub mod processor_service;
+pub mod pyerr;
 pub mod stage;
 pub mod stage_reader;
 pub mod util;
@@ -44,6 +45,8 @@ fn _datafusion_ray_internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dataframe::PyDFRayStage>()?;
     m.add_class::<processor_service::DFRayProcessorService>()?;
     m.add_class::<util::LocalValidator>()?;
+    m.add_class::<pyerr::PyExecutionPlan>()?;
+    m.add_class::<pyerr::PyLogicalPlan>()?;
     m.add_function(wrap_pyfunction!(util::prettify, m)?)?;
     Ok(())
 }
@@ -60,4 +63,34 @@ fn setup_logging() {
     env_logger::Builder::new()
         .parse_filters(&combined_env)
         .init();
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Everything python can reach goes through this one function, so a class
+    /// dropped from it disappears silently. `setup_logging` runs here too:
+    /// `env_logger` panics if a logger is already installed, which is why this
+    /// is the only test in the binary that may install one.
+    #[test]
+    fn the_module_exports_everything_python_imports() {
+        Python::attach(|py| {
+            let m = pyo3::wrap_pymodule!(_datafusion_ray_internal)(py);
+            let m = m.bind(py);
+            for name in [
+                "DFRayContext",
+                "DFRayDataFrame",
+                "PyDFRayStage",
+                "DFRayProcessorService",
+                "LocalValidator",
+                "ExecutionPlan",
+                "LogicalPlan",
+                "prettify",
+            ] {
+                assert!(m.hasattr(name).unwrap(), "{name} is not exported");
+            }
+        });
+        log::debug!("logging is initialised");
+    }
 }

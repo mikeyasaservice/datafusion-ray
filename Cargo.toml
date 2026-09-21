@@ -25,43 +25,37 @@ version = "0.1.0-rc2"
 edition = "2024"
 readme = "README.md"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.94"
 build = "build.rs"
 
 [dependencies]
 anyhow = "1"
-arrow = { version = "54", features = ["pyarrow", "ipc"] }
-arrow-flight = "54"
+arrow = { version = "59", features = ["pyarrow", "ipc"] }
+arrow-flight = "59"
 async-stream = "0.3"
 async-channel = "2.3"
 bytesize = "1.3"
-datafusion = { version = "45", features = ["pyarrow", "avro"] }
-datafusion-python = { version = "45" }
-datafusion-proto = "45"
+datafusion = { version = "55.1", features = ["avro"] }
+datafusion-proto = "55.1"
 env_logger = "0.11"
 futures = "0.3"
 glob = "0.3.1"
 itertools = "0.14"
 local-ip-address = "0.6"
 log = "0.4"
-object_store = { version = "0.11.0", features = [
+object_store = { version = "0.13", features = [
   "aws",
   "gcp",
   "azure",
   "http",
 ] }
 parking_lot = { version = "0.12", features = ["deadlock_detection"] }
-prost = "0.13"
-protobuf-src = "2.1"
-pyo3 = { version = "0.23", features = [
-  "extension-module",
-  "abi3",
-  "abi3-py38",
-] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
-pyo3-pylogger = "0.3.0"
+prost = "0.14"
+pyo3 = { version = "0.29", features = ["abi3", "abi3-py310"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+pyo3-pylogger = "0.5"
 rust_decimal = "1.36"
-tokio = { version = "1.43", features = [
+tokio = { version = "1.52", features = [
   "macros",
   "rt",
   "rt-multi-thread",
@@ -70,25 +64,32 @@ tokio = { version = "1.43", features = [
 ] }
 tokio-stream = "0.1"
 
-tonic = { version = "0.12.3", default-features = false, features = [
+tonic = { version = "0.14", default-features = false, features = [
   "transport",
   "codegen",
-  "prost",
+  "router",
 ] }
 uuid = "1.11.0"
 url = "2"
 
 [build-dependencies]
-prost-types = "0.13"
+prost-build = "0.14"
+prost-types = "0.14"
 rustc_version = "0.4.0"
-tonic-build = { version = "0.8", default-features = false, features = [
-  "transport",
-  "prost",
-] }
 url = "2"
+
+[features]
+# On by default so `maturin` and a plain `cargo build` produce the extension
+# module. Tests run with `--no-default-features` so the binary links libpython
+# and can execute the `#[pymethods]` bodies.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dev-dependencies]
 tempfile = "3.17"
+# starts the interpreter for tests that exercise the Python-facing API;
+# never enabled for the extension module itself
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
 
 [lib]
 name = "datafusion_ray"
@@ -105,6 +106,11 @@ debug = 0
 
 [profile.dev]
 opt-level = 1
+# Full debuginfo on the DataFusion tree costs tens of GB of target/ and this
+# crate is built in several feature configurations (extension-module on for
+# wheels, off for tests). Line tables are enough for backtraces and for
+# llvm-cov's line mapping.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 1

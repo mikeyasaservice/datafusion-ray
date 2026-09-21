@@ -21,9 +21,9 @@ use futures::stream::BoxStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use arrow_flight::{
-    flight_service_server::FlightService, Action, ActionType, Criteria, Empty, FlightData,
-    FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult,
-    SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    flight_service_server::FlightService,
 };
 
 pub type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
@@ -115,5 +115,136 @@ impl FlightService for FlightServ {
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("Unimplemented: do_exchange"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow_flight::Criteria;
+    use futures::StreamExt;
+
+    struct Echo;
+
+    #[tonic::async_trait]
+    impl FlightHandler for Echo {
+        async fn get_stream(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<DoGetStream>, Status> {
+            let bytes = request.into_inner().ticket;
+            let out = futures::stream::once(async move {
+                Ok(FlightData {
+                    data_header: bytes,
+                    ..Default::default()
+                })
+            });
+            Ok(Response::new(Box::pin(out) as DoGetStream))
+        }
+    }
+
+    fn serv() -> FlightServ {
+        FlightServ {
+            handler: Arc::new(Echo),
+        }
+    }
+
+    #[tokio::test]
+    async fn do_get_delegates_to_the_handler() {
+        let resp = serv()
+            .do_get(Request::new(Ticket {
+                ticket: vec![1, 2, 3].into(),
+            }))
+            .await
+            .unwrap();
+        let got = resp.into_inner().next().await.unwrap().unwrap();
+        assert_eq!(got.data_header.as_ref(), &[1, 2, 3]);
+    }
+
+    /// Only `do_get` is part of the stage protocol. The rest of the Flight
+    /// surface must refuse clearly rather than half-answer.
+    ///
+    /// `handshake`, `do_put` and `do_exchange` take `tonic::Streaming`, which
+    /// cannot be built outside a real connection, so they are refused over a
+    /// real socket in `the_streaming_methods_are_refused_over_a_connection`.
+    #[tokio::test]
+    async fn every_other_flight_method_is_refused() {
+        let s = serv();
+
+        macro_rules! refused {
+            ($call:expr, $name:literal) => {
+                match $call.await {
+                    Err(status) => assert_eq!(
+                        status.code(),
+                        tonic::Code::Unimplemented,
+                        concat!($name, " should be unimplemented")
+                    ),
+                    Ok(_) => panic!(concat!($name, " unexpectedly succeeded")),
+                }
+            };
+        }
+
+        refused!(
+            s.list_flights(Request::new(Criteria::default())),
+            "list_flights"
+        );
+        refused!(
+            s.get_flight_info(Request::new(FlightDescriptor::default())),
+            "get_flight_info"
+        );
+        refused!(
+            s.poll_flight_info(Request::new(FlightDescriptor::default())),
+            "poll_flight_info"
+        );
+        refused!(
+            s.get_schema(Request::new(FlightDescriptor::default())),
+            "get_schema"
+        );
+        refused!(s.do_action(Request::new(Action::default())), "do_action");
+        refused!(
+            s.list_actions(Request::new(Empty::default())),
+            "list_actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_methods_are_refused_over_a_connection() {
+        use arrow_flight::flight_service_server::FlightServiceServer;
+        use tokio::net::TcpListener;
+        use tonic::transport::Server;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(serv()))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+        });
+
+        let mut client = crate::util::make_client(&addr).await.unwrap();
+
+        let empty = || futures::stream::iter(Vec::<arrow_flight::error::Result<FlightData>>::new());
+        match client.handshake(vec![1, 2, 3]).await {
+            Err(e) => assert!(e.to_string().contains("handshake"), "got: {e}"),
+            Ok(_) => panic!("handshake unexpectedly succeeded"),
+        }
+        match client.do_put(empty()).await {
+            Err(e) => assert!(e.to_string().contains("do put"), "got: {e}"),
+            Ok(_) => panic!("do_put unexpectedly succeeded"),
+        }
+        match client.do_exchange(empty()).await {
+            Err(e) => assert!(e.to_string().contains("do_exchange"), "got: {e}"),
+            Ok(_) => panic!("do_exchange unexpectedly succeeded"),
+        }
+
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
     }
 }

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::pyerr::PyDataFusionResult;
+use crate::pyerr::wait_for_future;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -22,9 +24,8 @@ use datafusion::common::internal_datafusion_err;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-use datafusion::datasource::physical_plan::{
-    ArrowExec, AvroExec, CsvExec, NdJsonExec, ParquetExec,
-};
+use datafusion::datasource::physical_plan::{FileScanConfig, ParquetSource};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, SessionStateBuilder};
@@ -32,7 +33,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::AsExecutionPlan;
-use datafusion_python::utils::wait_for_future;
 use futures::{Stream, StreamExt};
 use log::debug;
 use object_store::ObjectStore;
@@ -87,7 +87,7 @@ pub fn batch_to_ipc(py: Python, batch: PyArrowType<RecordBatch>) -> PyResult<Py<
 }
 
 #[pyfunction]
-pub fn ipc_to_batch(bytes: &[u8], py: Python) -> PyResult<PyObject> {
+pub fn ipc_to_batch<'py>(bytes: &[u8], py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
     let batch = ipc_to_batch_helper(bytes).to_py_err()?;
     batch.to_pyarrow(py)
 }
@@ -127,7 +127,7 @@ pub fn bytes_to_physical_plan(
     let proto_plan = datafusion_proto::protobuf::PhysicalPlanNode::try_decode(plan_bytes)?;
 
     let codec = RayCodec {};
-    let plan = proto_plan.try_into_physical_plan(ctx, ctx.runtime_env().as_ref(), &codec)?;
+    let plan = proto_plan.try_into_physical_plan(&ctx.task_ctx(), &codec)?;
     Ok(plan)
 }
 
@@ -226,7 +226,7 @@ pub fn input_stage_ids(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<usize>, Data
     let mut result = vec![];
     plan.clone()
         .transform_down(|node: Arc<dyn ExecutionPlan>| {
-            if let Some(reader) = node.as_any().downcast_ref::<DFRayStageReaderExec>() {
+            if let Some(reader) = node.downcast_ref::<DFRayStageReaderExec>() {
                 result.push(reader.stage_id);
             }
             Ok(Transformed::no(node))
@@ -275,23 +275,66 @@ where
     Box::pin(out_stream)
 }
 
-/// ParquetExecs do not correctly preserve their options when serialized to substrait.
-/// So we fix it here.
+/// Settings that the session which *plans* a query must carry.
 ///
-/// Walk the plan tree and update any ParquetExec nodes to set the options we need.
-/// We'll use this method until we are using a DataFusion version which includes thf
-/// fix https://github.com/apache/datafusion/pull/14465
-pub fn fix_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    Ok(plan
-        .transform_up(|node| {
-            if let Some(parquet) = node.as_any().downcast_ref::<ParquetExec>() {
-                let new_parquet_node = parquet.clone().with_pushdown_filters(true);
-                Ok(Transformed::yes(Arc::new(new_parquet_node)))
-            } else {
-                Ok(Transformed::no(node))
-            }
-        })?
-        .data)
+/// Both of these keep DataFusion 55 from choosing plan shapes that assume every
+/// partition of a plan is executed in one process, which is not how stages run
+/// here — `PartitionIsolatorExec` gives each processor only its partition group.
+///
+/// * `CollectLeft` hash joins broadcast the build side and emit the left-side
+///   rows of a semi/anti/outer join only from the probe partition that finishes
+///   last (`probe_threads_counter` reaching zero in
+///   `hash_join::exec::report_probe_completed`). A processor never runs the
+///   whole probe side, so that never happens and the join yields nothing —
+///   TPC-H q4 came back empty. Zeroing the thresholds forces `Partitioned`
+///   joins, where each partition builds its own side and emits independently.
+/// * Uncorrelated scalar subqueries are planned as a `ScalarSubqueryExec`
+///   wrapping a `ScalarSubqueryExpr`. Stage splitting separates them, and the
+///   expression then fails to deserialize ("can only be deserialized as part of
+///   a surrounding ScalarSubqueryExec") — TPC-H q11. DataFusion documents this
+///   flag as an escape hatch for exactly this case; turning it off restores the
+///   rewrite-to-join behaviour that DataFusion 45 used.
+pub(crate) fn apply_planning_settings(config: &mut SessionConfig) {
+    let options = config.options_mut();
+    options.optimizer.hash_join_single_partition_threshold = 0;
+    options.optimizer.hash_join_single_partition_threshold_rows = 0;
+    options
+        .optimizer
+        .enable_physical_uncorrelated_scalar_subquery = false;
+}
+
+/// Settings that every datafusion-ray session which *executes* a plan must
+/// carry.
+///
+/// DataFusion 55 defaults `enable_file_stream_work_stealing` to true, letting
+/// sibling partitions of a file scan share one queue of unopened files. That
+/// assumes all partitions are polled in the same process. We run one partition
+/// per processor on its own copy of the plan and never poll the siblings, so a
+/// lone partition would drain the whole queue: every processor would read the
+/// entire table and the query would silently return each row once per
+/// processor rather than failing.
+pub(crate) fn apply_execution_settings(config: &mut SessionConfig) {
+    let options = config.options_mut();
+    options.execution.enable_file_stream_work_stealing = false;
+
+    // Same mismatch, second mechanism. A `CollectLeft` hash join publishes a
+    // dynamic filter to the scans below its probe side, coordinated by
+    // `SharedBuildAccumulator`: `collect_build_side` must be called once per
+    // output partition before the last caller is elected to publish the filter
+    // and wake the partitions parked in `wait_for_completion`. The partitions
+    // `PartitionIsolatorExec` masks out never call it, so that count is never
+    // reached and the stage deadlocks with no CPU in use.
+    //
+    // The join reads this flag from the *executing* TaskContext, not from the
+    // session that planned the query.
+    options.optimizer.enable_join_dynamic_filter_pushdown = false;
+    // The TopK and aggregate variants coordinate across partitions the same
+    // way. DataFusion 45 had no dynamic filters at all, so turning the family
+    // off keeps pre-rebase behaviour; re-enabling whichever are safe under
+    // partition isolation is a performance follow-up.
+    options.optimizer.enable_dynamic_filter_pushdown = false;
+    options.optimizer.enable_topk_dynamic_filter_pushdown = false;
+    options.optimizer.enable_aggregate_dynamic_filter_pushdown = false;
 }
 
 pub async fn collect_from_stage(
@@ -305,7 +348,8 @@ pub async fn collect_from_stage(
     let client = make_client(stage_addr).await?;
 
     client_map.insert((stage_id, partition), Mutex::new(vec![client]));
-    let config = SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map)));
+    let mut config = SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map)));
+    apply_execution_settings(&mut config);
 
     let state = SessionStateBuilder::new()
         .with_default_features()
@@ -388,7 +432,10 @@ pub fn display_plan_with_partition_counts(plan: &Arc<dyn ExecutionPlan>) -> impl
 }
 
 fn print_node(plan: &Arc<dyn ExecutionPlan>, indent: usize, output: &mut String) {
-    let extra = if let Some(parquet) = plan.as_any().downcast_ref::<ParquetExec>() {
+    let extra = if let Some((_, parquet)) = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.downcast_to_file_source::<ParquetSource>())
+    {
         &format!(
             " [pushdown filters: {}]",
             parquet.table_parquet_options().global.pushdown_filters
@@ -423,7 +470,12 @@ impl LocalValidator {
         Self { ctx }
     }
 
-    pub fn register_parquet(&self, py: Python, name: String, path: String) -> PyResult<()> {
+    pub fn register_parquet(
+        &self,
+        py: Python,
+        name: String,
+        path: String,
+    ) -> PyDataFusionResult<()> {
         let options = ParquetReadOptions::default();
 
         let url = ListingTableUrl::parse(&path).to_py_err()?;
@@ -431,7 +483,7 @@ impl LocalValidator {
         maybe_register_object_store(&self.ctx, url.as_ref()).to_py_err()?;
         debug!("register_parquet: registering table {} at {}", name, path);
 
-        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))?;
+        wait_for_future(py, self.ctx.register_parquet(&name, &path, options.clone()))??;
         Ok(())
     }
 
@@ -442,7 +494,7 @@ impl LocalValidator {
         name: &str,
         path: &str,
         file_extension: &str,
-    ) -> PyResult<()> {
+    ) -> PyDataFusionResult<()> {
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::new())).with_file_extension(file_extension);
 
@@ -459,12 +511,12 @@ impl LocalValidator {
             py,
             self.ctx
                 .register_listing_table(name, path, options, None, None),
-        )
-        .to_py_err()
+        )??;
+        Ok(())
     }
 
     #[pyo3(signature = (query))]
-    fn collect_sql(&self, py: Python, query: String) -> PyResult<PyObject> {
+    fn collect_sql(&self, py: Python, query: String) -> PyDataFusionResult<Py<PyAny>> {
         let fut = async || {
             let df = self.ctx.sql(&query).await?;
             let batches = df.collect().await?;
@@ -472,8 +524,7 @@ impl LocalValidator {
             Ok::<_, DataFusionError>(batches)
         };
 
-        let batches = wait_for_future(py, fut())
-            .to_py_err()?
+        let batches = wait_for_future(py, fut())??
             .iter()
             .map(|batch| batch.to_pyarrow(py))
             .collect::<PyResult<Vec<_>>>()?;
@@ -489,21 +540,10 @@ pub(crate) fn register_object_store_for_paths_in_plan(
 ) -> Result<(), DataFusionError> {
     let check_plan = |plan: Arc<dyn ExecutionPlan>| -> Result<_, DataFusionError> {
         for input in plan.children().into_iter() {
-            if let Some(node) = input.as_any().downcast_ref::<ParquetExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<CsvExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<NdJsonExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<AvroExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
-            } else if let Some(node) = input.as_any().downcast_ref::<ArrowExec>() {
-                let url = &node.base_config().object_store_url;
-                maybe_register_object_store(ctx, url.as_ref())?
+            if let Some(scan) = input.downcast_ref::<DataSourceExec>()
+                && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+            {
+                maybe_register_object_store(ctx, config.object_store_url.as_ref())?
             }
         }
         Ok(Transformed::no(plan))
@@ -581,13 +621,16 @@ pub(crate) fn maybe_register_object_store(
 
 #[cfg(test)]
 mod test {
+    use crate::max_rows::MaxRowsExec;
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::empty::EmptyExec;
     use std::{sync::Arc, vec};
 
     use arrow::{
         array::Int32Array,
         datatypes::{DataType, Field, Schema},
     };
-    
+
     use futures::stream;
 
     use super::*;
@@ -607,9 +650,10 @@ mod test {
     #[tokio::test]
     async fn test_max_rows_stream() {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![
-            1, 2, 3, 4, 5, 6, 7, 8,
-        ]))])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]))],
+        )
         .unwrap();
 
         // 24 total rows
@@ -635,5 +679,384 @@ mod test {
         assert_eq!(batches[6].as_ref().unwrap().num_rows(), 3);
         assert_eq!(batches[7].as_ref().unwrap().num_rows(), 3);
         assert_eq!(batches[8].as_ref().unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn execution_sessions_disable_file_stream_work_stealing() {
+        // Regression guard: with DataFusion 55's default a processor executing
+        // a single partition drains the whole file-scan queue, so every
+        // processor reads the entire table and query results are silently
+        // multiplied by the processor count.
+        let mut config = SessionConfig::new();
+        assert!(
+            config.options().execution.enable_file_stream_work_stealing,
+            "DataFusion no longer defaults this on; revisit apply_execution_settings"
+        );
+        apply_execution_settings(&mut config);
+        assert!(!config.options().execution.enable_file_stream_work_stealing);
+    }
+
+    /// `CombinedRecordBatchStream` merges one partition's streams from every
+    /// processor hosting a stage. Its round-robin `poll_next` removes exhausted
+    /// entries with `swap_remove`, so the cursor arithmetic has to hold as the
+    /// vector shrinks under it.
+    fn batch(vals: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vals))]).unwrap()
+    }
+
+    fn stream_of(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+
+    fn int_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    async fn drain(mut s: SendableRecordBatchStream) -> Vec<i32> {
+        let mut out = vec![];
+        while let Some(b) = s.next().await {
+            let b = b.unwrap();
+            let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            out.extend(col.iter().flatten());
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn combined_stream_merges_every_entry() {
+        let s = CombinedRecordBatchStream::new(
+            int_schema(),
+            vec![
+                stream_of(vec![batch(vec![1, 2])]),
+                stream_of(vec![batch(vec![3])]),
+                stream_of(vec![batch(vec![4, 5, 6])]),
+            ],
+        );
+        assert_eq!(s.schema(), int_schema());
+        assert_eq!(drain(Box::pin(s)).await, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn combined_stream_handles_empty_and_exhausted_entries() {
+        // entries that finish at different points exercise the swap_remove path
+        let s = CombinedRecordBatchStream::new(
+            int_schema(),
+            vec![
+                stream_of(vec![]),
+                stream_of(vec![batch(vec![7])]),
+                stream_of(vec![]),
+                stream_of(vec![batch(vec![8, 9])]),
+            ],
+        );
+        assert_eq!(drain(Box::pin(s)).await, vec![7, 8, 9]);
+
+        let empty = CombinedRecordBatchStream::new(int_schema(), vec![]);
+        assert!(drain(Box::pin(empty)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn combined_stream_propagates_errors() {
+        let failing: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            int_schema(),
+            futures::stream::iter(vec![Err(internal_datafusion_err!("boom"))]),
+        ));
+        let mut s = CombinedRecordBatchStream::new(int_schema(), vec![failing]);
+        let got = s.next().await.unwrap();
+        assert!(got.unwrap_err().to_string().contains("boom"));
+    }
+
+    #[test]
+    fn ticket_round_trips_and_rejects_garbage() {
+        let ticket = Ticket {
+            ticket: FlightTicketData {
+                dummy: false,
+                partition: 7,
+            }
+            .encode_to_vec()
+            .into(),
+        };
+        assert_eq!(extract_ticket(ticket).unwrap(), 7);
+
+        let bad = Ticket {
+            ticket: vec![0xff, 0xff, 0xff].into(),
+        };
+        assert!(extract_ticket(bad).is_err());
+    }
+
+    #[test]
+    fn planning_settings_keep_partition_isolation_safe() {
+        // mirrors the execution-side guard: assert DataFusion's default first,
+        // so this fails if upstream changes it rather than silently passing
+        let mut config = SessionConfig::new();
+        let opts = config.options();
+        assert!(opts.optimizer.hash_join_single_partition_threshold > 0);
+        assert!(opts.optimizer.hash_join_single_partition_threshold_rows > 0);
+        assert!(opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+
+        apply_planning_settings(&mut config);
+        let opts = config.options();
+        assert_eq!(opts.optimizer.hash_join_single_partition_threshold, 0);
+        assert_eq!(opts.optimizer.hash_join_single_partition_threshold_rows, 0);
+        assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+    }
+
+    #[test]
+    fn object_store_registration_covers_each_scheme() {
+        let ctx = SessionContext::new();
+        // none of these open a connection, so no credentials are needed
+        for url in [
+            "file:///tmp/x",
+            "http://example.com/x",
+            "https://example.com/x",
+            "s3://bucket/k",
+            "gs://bucket/k",
+            "gcs://bucket/k",
+        ] {
+            maybe_register_object_store(&ctx, &Url::parse(url).unwrap())
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+
+        // and each one is reachable afterwards under its own url
+        let env = ctx.runtime_env();
+        for url in ["s3://bucket/", "gs://bucket/", "https://example.com/"] {
+            assert!(
+                env.object_store(ObjectStoreUrl::parse(url).unwrap())
+                    .is_ok(),
+                "{url} was not registered"
+            );
+        }
+
+        // a bucket scheme that carries no host cannot name a bucket
+        // (http is not in this list: url gives it an empty host rather than none)
+        for url in ["s3:///nohost", "gs:///nohost"] {
+            assert!(
+                maybe_register_object_store(&ctx, &Url::parse(url).unwrap()).is_err(),
+                "{url} should not have produced a store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_display_reports_partition_counts_and_pushdown() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        ctx.sql(&format!(
+            "copy (select v as a from generate_series(1, 10) t(v)) to '{}' stored as parquet",
+            path.display()
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        ctx.register_parquet(
+            "t",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let plan = ctx
+            .sql("select a from t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let shown = display_plan_with_partition_counts(&plan).to_string();
+        assert!(shown.contains("output_partitions"));
+        assert!(shown.contains("DataSourceExec"));
+        assert!(shown.contains("pushdown filters:"), "got: {shown}");
+    }
+
+    #[tokio::test]
+    async fn input_stage_ids_finds_every_reader() {
+        let schema = int_schema();
+        let a = Arc::new(
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(1), schema.clone(), 3)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        assert_eq!(input_stage_ids(&a).unwrap(), vec![3]);
+
+        let wrapped = Arc::new(MaxRowsExec::new(a, 10)) as Arc<dyn ExecutionPlan>;
+        assert_eq!(input_stage_ids(&wrapped).unwrap(), vec![3]);
+
+        let none = Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>;
+        assert!(input_stage_ids(&none).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_on_lag_returns_the_inner_value() {
+        assert_eq!(report_on_lag("quick", async { 42 }).await, 42);
+    }
+
+    /// Processors receive a serialized plan and must register a store for
+    /// every path it scans before they can execute it.
+    #[tokio::test]
+    async fn stores_are_registered_for_every_scan_in_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        let writer = SessionContext::new();
+        writer
+            .sql(&format!(
+                "copy (select v as a from generate_series(1, 4) t(v)) to '{}' stored as parquet",
+                path.display()
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        writer
+            .register_parquet(
+                "t",
+                path.to_str().unwrap(),
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .unwrap();
+        let plan = writer
+            .sql("select a from t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // the scan is the root here, so wrap it: the walk inspects children
+        let wrapped = Arc::new(MaxRowsExec::new(plan, 10)) as Arc<dyn ExecutionPlan>;
+        let fresh = SessionContext::new();
+        register_object_store_for_paths_in_plan(&fresh, wrapped).unwrap();
+        assert!(
+            fresh
+                .runtime_env()
+                .object_store(ObjectStoreUrl::parse("file://").unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn to_py_err_passes_values_through_and_wraps_failures() {
+        Python::attach(|py| {
+            let ok: Result<usize, String> = Ok(7);
+            assert_eq!(ok.to_py_err().unwrap(), 7);
+
+            let bad: Result<usize, String> = Err("no good".to_string());
+            let err = bad.to_py_err().unwrap_err();
+            assert!(err.to_string().contains("no good"), "got: {err}");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyException>(py));
+        });
+    }
+
+    /// The ipc pyfunctions exist so batches cross to python without pyarrow's
+    /// C++ writer, which produces unaligned buffers we cannot read back.
+    #[test]
+    fn the_ipc_pyfunctions_round_trip_a_batch_through_python() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        Python::attach(|py| {
+            let bytes = batch_to_ipc(py, PyArrowType(batch.clone())).unwrap();
+            let bound = bytes.bind(py);
+            let raw: Vec<u8> = bound.extract().unwrap();
+            assert!(!raw.is_empty());
+
+            let back = ipc_to_batch(&raw, py).unwrap();
+            assert_eq!(
+                back.getattr("num_rows")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                3
+            );
+
+            // garbage in is an exception, not a panic
+            assert!(ipc_to_batch(b"not ipc at all", py).is_err());
+        });
+    }
+
+    #[test]
+    fn prettify_formats_batches_and_rejects_non_batches() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+
+        Python::attach(|py| {
+            let list = PyList::new(py, [batch.to_pyarrow(py).unwrap()]).unwrap();
+            let table = prettify(list).unwrap();
+            assert!(table.contains('a'), "got: {table}");
+            assert!(table.contains('1') && table.contains('2'), "got: {table}");
+
+            let not_batches = PyList::new(py, [1i32, 2]).unwrap();
+            assert!(prettify(not_batches).is_err());
+        });
+    }
+
+    /// `LocalValidator` is the single-process context the test harness compares
+    /// distributed answers against, so it has to produce the same rows.
+    #[test]
+    fn local_validator_answers_a_query_over_registered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        crate::pyerr::get_tokio_runtime().block_on(async {
+            let writer = SessionContext::new();
+            writer
+                .sql(&format!(
+                    "copy (select v as a from generate_series(1, 5) t(v)) to '{}' \
+                     stored as parquet",
+                    path.display()
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        });
+
+        let mut v = LocalValidator::new();
+        Python::attach(|py| {
+            v.register_parquet(py, "p".into(), path.display().to_string())
+                .unwrap();
+            v.register_listing_table(py, "l", dir.path().to_str().unwrap(), ".parquet")
+                .unwrap();
+
+            for table in ["p", "l"] {
+                let batches = v
+                    .collect_sql(py, format!("select sum(a) as s from {table}"))
+                    .unwrap();
+                let rendered = prettify(batches.bind(py).cast().unwrap().clone()).unwrap();
+                assert!(rendered.contains("15"), "{table}: {rendered}");
+            }
+
+            match v.collect_sql(py, "select * from nowhere".into()) {
+                Ok(_) => panic!("expected an error for an unregistered table"),
+                Err(e) => assert!(e.to_string().contains("nowhere"), "got: {e}"),
+            }
+            assert!(
+                v.register_parquet(py, "x".into(), "/nonexistent/x.parquet".into())
+                    .is_err()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_lag_reporting_stream_passes_its_items_through() {
+        let items = stream::iter(vec![1, 2, 3]);
+        let out: Vec<i32> = lag_reporting_stream("test", items).collect().await;
+        assert_eq!(out, vec![1, 2, 3]);
     }
 }
