@@ -23,6 +23,10 @@ use datafusion::common::tree_node::TreeNode;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 // see coalesce_batches() below for why this deprecated operator is still used
+use crate::pyerr::PyExecutionPlan;
+use crate::pyerr::PyLogicalPlan;
+use crate::pyerr::wait_for_future;
+use crate::pyerr::{PyDataFusionError, PyDataFusionResult};
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::displayable;
@@ -32,10 +36,6 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::DataFrame;
-use crate::pyerr::{PyDataFusionError, PyDataFusionResult};
-use crate::pyerr::PyExecutionPlan;
-use crate::pyerr::PyLogicalPlan;
-use crate::pyerr::wait_for_future;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use log::trace;
@@ -94,133 +94,16 @@ impl DFRayDataFrame {
         prefetch_buffer_size: usize,
         partitions_per_worker: Option<usize>,
     ) -> PyDataFusionResult<Vec<PyDFRayStage>> {
-        let mut stages = vec![];
-
-        let mut partition_groups = vec![];
-        let mut full_partitions = false;
-        // We walk up the tree from the leaves to find the stages, record ray stages, and replace
-        // each ray stage with a corresponding ray reader stage.
-        let up = |plan: Arc<dyn ExecutionPlan>| {
-            trace!(
-                "Examining plan up: {}",
-                displayable(plan.as_ref()).one_line()
-            );
-
-            if let Some(stage_exec) = plan.downcast_ref::<DFRayStageExec>() {
-                trace!("ray stage exec");
-                let input = plan.children();
-                assert!(input.len() == 1, "RayStageExec must have exactly one child");
-                let input = input[0];
-
-                let replacement = Arc::new(DFRayStageReaderExec::try_new(
-                    plan.output_partitioning().clone(),
-                    input.schema(),
-                    stage_exec.stage_id,
-                )?) as Arc<dyn ExecutionPlan>;
-
-                let stage = PyDFRayStage::new(
-                    stage_exec.stage_id,
-                    input.clone(),
-                    partition_groups.clone(),
-                    full_partitions,
-                );
-                partition_groups = vec![];
-                full_partitions = false;
-
-                stages.push(stage);
-                Ok(Transformed::yes(replacement))
-            } else if plan.downcast_ref::<RepartitionExec>().is_some() {
-                trace!("repartition exec");
-                let (calculated_partition_groups, replacement) = build_replacement(
-                    plan,
-                    prefetch_buffer_size,
-                    partitions_per_worker,
-                    true,
-                    batch_size,
-                    batch_size,
-                )?;
-                partition_groups = calculated_partition_groups;
-
-                Ok(Transformed::yes(replacement))
-            } else if plan.downcast_ref::<SortExec>().is_some() {
-                trace!("sort exec");
-                let (calculated_partition_groups, replacement) = build_replacement(
-                    plan,
-                    prefetch_buffer_size,
-                    partitions_per_worker,
-                    false,
-                    batch_size,
-                    batch_size,
-                )?;
-                partition_groups = calculated_partition_groups;
-                full_partitions = true;
-
-                Ok(Transformed::yes(replacement))
-            } else if plan.downcast_ref::<NestedLoopJoinExec>().is_some() {
-                trace!("nested loop join exec");
-                // NestedLoopJoinExec must be on a stage by itself as it materializes the entire left
-                // side of the join and is not suitable to be executed in a partitioned manner.
-                let mut replacement = plan.clone();
-                let partition_count = plan.output_partitioning().partition_count();
-                trace!("nested join output partitioning {}", partition_count);
-
-                replacement = Arc::new(MaxRowsExec::new(
-                    coalesce_batches(replacement, batch_size),
-                    batch_size,
-                )) as Arc<dyn ExecutionPlan>;
-
-                if prefetch_buffer_size > 0 {
-                    replacement = Arc::new(PrefetchExec::new(replacement, prefetch_buffer_size))
-                        as Arc<dyn ExecutionPlan>;
-                }
-                partition_groups = vec![(0..partition_count).collect()];
-                full_partitions = true;
-                Ok(Transformed::yes(replacement))
-            } else {
-                trace!("not special case");
-                Ok(Transformed::no(plan))
-            }
-        };
-
         let physical_plan = wait_for_future(py, self.df.clone().create_physical_plan())??;
-
-        physical_plan.transform_up(up)?;
-
-        // add coalesce and max rows to last stage
-        let mut last_stage = stages
-            .pop()
-            .ok_or(internal_datafusion_err!("No stages found"))?;
-
-        if last_stage.num_output_partitions() > 1 {
-            return Err(
-                internal_datafusion_err!("Last stage expected to have one partition").into(),
-            );
-        }
-
-        last_stage = PyDFRayStage::new(
-            last_stage.stage_id,
-            Arc::new(MaxRowsExec::new(
-                coalesce_batches(last_stage.plan, batch_size),
-                batch_size,
-            )) as Arc<dyn ExecutionPlan>,
-            vec![vec![0]],
-            true,
-        );
-
-        // done fixing last stage
-
-        let reader_plan = Arc::new(DFRayStageReaderExec::try_new_from_input(
-            last_stage.plan.clone(),
-            last_stage.stage_id,
-        )?) as Arc<dyn ExecutionPlan>;
-
-        stages.push(last_stage);
-
+        let (stages, reader_plan) = build_stages(
+            physical_plan,
+            batch_size,
+            prefetch_buffer_size,
+            partitions_per_worker,
+        )?;
         self.final_plan = Some(reader_plan);
-
         Ok(stages)
     }
-
     fn execution_plan(&self, py: Python) -> PyDataFusionResult<PyExecutionPlan> {
         let plan = wait_for_future(py, self.df.clone().create_physical_plan())??;
         Ok(PyExecutionPlan::new(plan))
@@ -271,6 +154,142 @@ impl DFRayDataFrame {
 #[allow(deprecated)]
 fn coalesce_batches(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Arc<dyn ExecutionPlan> {
     Arc::new(CoalesceBatchesExec::new(input, batch_size)) as Arc<dyn ExecutionPlan>
+}
+
+/// Split a physical plan into the stages each processor will host.
+///
+/// Walks the plan bottom-up replacing every `DFRayStageExec` marker with a
+/// `DFRayStageReaderExec`, recording the stage it displaced. Returns the stages
+/// and the reader plan the driver uses to consume the last one.
+///
+/// Extracted from `DFRayDataFrame::stages` so it can be tested without a Python
+/// interpreter: the only part that needed one was awaiting the physical plan.
+#[allow(clippy::type_complexity)]
+fn build_stages(
+    physical_plan: Arc<dyn ExecutionPlan>,
+    batch_size: usize,
+    prefetch_buffer_size: usize,
+    partitions_per_worker: Option<usize>,
+) -> Result<(Vec<PyDFRayStage>, Arc<dyn ExecutionPlan>), DataFusionError> {
+    let mut stages = vec![];
+
+    let mut partition_groups = vec![];
+    let mut full_partitions = false;
+    // We walk up the tree from the leaves to find the stages, record ray stages, and replace
+    // each ray stage with a corresponding ray reader stage.
+    let up = |plan: Arc<dyn ExecutionPlan>| {
+        trace!(
+            "Examining plan up: {}",
+            displayable(plan.as_ref()).one_line()
+        );
+
+        if let Some(stage_exec) = plan.downcast_ref::<DFRayStageExec>() {
+            trace!("ray stage exec");
+            let input = plan.children();
+            assert!(input.len() == 1, "RayStageExec must have exactly one child");
+            let input = input[0];
+
+            let replacement = Arc::new(DFRayStageReaderExec::try_new(
+                plan.output_partitioning().clone(),
+                input.schema(),
+                stage_exec.stage_id,
+            )?) as Arc<dyn ExecutionPlan>;
+
+            let stage = PyDFRayStage::new(
+                stage_exec.stage_id,
+                input.clone(),
+                partition_groups.clone(),
+                full_partitions,
+            );
+            partition_groups = vec![];
+            full_partitions = false;
+
+            stages.push(stage);
+            Ok(Transformed::yes(replacement))
+        } else if plan.downcast_ref::<RepartitionExec>().is_some() {
+            trace!("repartition exec");
+            let (calculated_partition_groups, replacement) = build_replacement(
+                plan,
+                prefetch_buffer_size,
+                partitions_per_worker,
+                true,
+                batch_size,
+                batch_size,
+            )?;
+            partition_groups = calculated_partition_groups;
+
+            Ok(Transformed::yes(replacement))
+        } else if plan.downcast_ref::<SortExec>().is_some() {
+            trace!("sort exec");
+            let (calculated_partition_groups, replacement) = build_replacement(
+                plan,
+                prefetch_buffer_size,
+                partitions_per_worker,
+                false,
+                batch_size,
+                batch_size,
+            )?;
+            partition_groups = calculated_partition_groups;
+            full_partitions = true;
+
+            Ok(Transformed::yes(replacement))
+        } else if plan.downcast_ref::<NestedLoopJoinExec>().is_some() {
+            trace!("nested loop join exec");
+            // NestedLoopJoinExec must be on a stage by itself as it materializes the entire left
+            // side of the join and is not suitable to be executed in a partitioned manner.
+            let mut replacement = plan.clone();
+            let partition_count = plan.output_partitioning().partition_count();
+            trace!("nested join output partitioning {}", partition_count);
+
+            replacement = Arc::new(MaxRowsExec::new(
+                coalesce_batches(replacement, batch_size),
+                batch_size,
+            )) as Arc<dyn ExecutionPlan>;
+
+            if prefetch_buffer_size > 0 {
+                replacement = Arc::new(PrefetchExec::new(replacement, prefetch_buffer_size))
+                    as Arc<dyn ExecutionPlan>;
+            }
+            partition_groups = vec![(0..partition_count).collect()];
+            full_partitions = true;
+            Ok(Transformed::yes(replacement))
+        } else {
+            trace!("not special case");
+            Ok(Transformed::no(plan))
+        }
+    };
+
+    physical_plan.transform_up(up)?;
+
+    // add coalesce and max rows to last stage
+    let mut last_stage = stages
+        .pop()
+        .ok_or(internal_datafusion_err!("No stages found"))?;
+
+    if last_stage.num_output_partitions() > 1 {
+        return Err(internal_datafusion_err!("Last stage expected to have one partition").into());
+    }
+
+    last_stage = PyDFRayStage::new(
+        last_stage.stage_id,
+        Arc::new(MaxRowsExec::new(
+            coalesce_batches(last_stage.plan, batch_size),
+            batch_size,
+        )) as Arc<dyn ExecutionPlan>,
+        vec![vec![0]],
+        true,
+    );
+
+    // done fixing last stage
+
+    let reader_plan = Arc::new(DFRayStageReaderExec::try_new_from_input(
+        last_stage.plan.clone(),
+        last_stage.stage_id,
+    )?) as Arc<dyn ExecutionPlan>;
+
+    stages.push(last_stage);
+
+    Ok((stages, reader_plan))
 }
 
 #[allow(clippy::type_complexity)]
@@ -483,6 +502,209 @@ async fn next_stream(
             } else {
                 Err(PyStopAsyncIteration::new_err("stream exhausted"))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    /// A context whose plans split into stages the way the driver's does.
+    fn ctx(target_partitions: usize) -> SessionContext {
+        let mut config = SessionConfig::new().with_target_partitions(target_partitions);
+        crate::util::apply_planning_settings(&mut config);
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(crate::physical::RayStageOptimizerRule::new()))
+            .with_config(config)
+            .build();
+        SessionContext::new_with_state(state)
+    }
+
+    async fn plan_for(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+        ctx.sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// Registers three parquet files so scans split predictably.
+    ///
+    /// The files are written with a plain context: `ctx` carries
+    /// `RayStageOptimizerRule`, which plants `DFRayStageExec` markers whose
+    /// `execute` is `unimplemented!` by design, so it cannot run a COPY.
+    async fn with_table(ctx: &SessionContext, dir: &std::path::Path) {
+        let writer = SessionContext::new();
+        for i in 0..3 {
+            let path = dir.join(format!("p{i}.parquet"));
+            writer
+                .sql(&format!(
+                    "copy (select {i} as k, v as a from generate_series(1, 50) t(v)) to '{}' \
+                 stored as parquet",
+                    path.display()
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        }
+        ctx.register_parquet(
+            "t",
+            dir.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn last_stage_is_coalesced_to_one_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(3);
+        with_table(&ctx, dir.path()).await;
+
+        let plan = plan_for(&ctx, "select k, count(*) from t group by k order by k").await;
+        let (stages, reader) = build_stages(plan, 8192, 0, Some(2)).unwrap();
+
+        let last = stages.last().unwrap();
+        assert_eq!(
+            last.num_output_partitions(),
+            1,
+            "driver reads one partition"
+        );
+        assert!(last.full_partitions, "last stage hosts complete partitions");
+        assert_eq!(last.partition_groups, vec![vec![0]]);
+        // the reader the driver consumes is wired to the last stage
+        assert_eq!(reader.output_partitioning().partition_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stages_are_numbered_and_linked_child_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(3);
+        with_table(&ctx, dir.path()).await;
+
+        let plan = plan_for(&ctx, "select k, count(*) from t group by k order by k").await;
+        let (stages, _) = build_stages(plan, 8192, 0, Some(2)).unwrap();
+
+        assert!(
+            stages.len() >= 2,
+            "a repartition and a sort should both split"
+        );
+        let ids: Vec<usize> = stages.iter().map(|s| s.stage_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ids, sorted, "stage ids are unique and ascending");
+
+        // every stage but the first consumes the one below it
+        for w in stages.windows(2) {
+            let children = w[1].child_stage_ids().unwrap();
+            assert!(
+                children.contains(&w[0].stage_id),
+                "stage {} should read stage {}, got {children:?}",
+                w[1].stage_id,
+                w[0].stage_id
+            );
+        }
+    }
+
+    /// The isolator is what lets one stage span several processors, and it is
+    /// only correct to insert it when the partitions actually split into more
+    /// than one group.
+    #[tokio::test]
+    async fn isolator_is_inserted_only_when_partitions_span_processors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(3);
+        with_table(&ctx, dir.path()).await;
+        // the last stage must coalesce to a single partition, so the query needs an order by
+        let sql = "select k, count(*) from t group by k order by k";
+
+        let split = build_stages(plan_for(&ctx, sql).await, 8192, 0, Some(2))
+            .unwrap()
+            .0;
+        assert!(
+            split.iter().any(|s| s
+                .display_execution_plan()
+                .unwrap()
+                .contains("PartitionIsolatorExec")),
+            "two groups over three partitions needs an isolator"
+        );
+        assert_eq!(split[0].partition_groups, vec![vec![0, 1], vec![2]]);
+
+        let whole = build_stages(plan_for(&ctx, sql).await, 8192, 0, Some(3))
+            .unwrap()
+            .0;
+        assert!(
+            !whole.iter().any(|s| s
+                .display_execution_plan()
+                .unwrap()
+                .contains("PartitionIsolatorExec")),
+            "a single group per stage must not be isolated"
+        );
+        assert_eq!(whole[0].partition_groups, vec![vec![0, 1, 2]]);
+
+        let none = build_stages(plan_for(&ctx, sql).await, 8192, 0, None)
+            .unwrap()
+            .0;
+        assert_eq!(none[0].partition_groups, vec![vec![0, 1, 2]]);
+    }
+
+    #[tokio::test]
+    async fn prefetch_is_inserted_only_when_a_buffer_is_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(3);
+        with_table(&ctx, dir.path()).await;
+        // the last stage must coalesce to a single partition, so the query needs an order by
+        let sql = "select k, count(*) from t group by k order by k";
+
+        let off = build_stages(plan_for(&ctx, sql).await, 8192, 0, Some(2))
+            .unwrap()
+            .0;
+        assert!(
+            !off.iter()
+                .any(|s| s.display_execution_plan().unwrap().contains("PrefetchExec"))
+        );
+
+        let on = build_stages(plan_for(&ctx, sql).await, 8192, 4, Some(2))
+            .unwrap()
+            .0;
+        assert!(
+            on.iter()
+                .any(|s| s.display_execution_plan().unwrap().contains("PrefetchExec"))
+        );
+    }
+
+    #[tokio::test]
+    async fn every_stage_round_trips_through_the_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(3);
+        with_table(&ctx, dir.path()).await;
+
+        let plan = plan_for(&ctx, "select k, count(*) from t group by k order by k").await;
+        let (stages, _) = build_stages(plan, 8192, 2, Some(2)).unwrap();
+
+        // this is what actually crosses the wire to each processor
+        for s in &stages {
+            let bytes = s.plan_bytes().unwrap();
+            assert!(!bytes.is_empty(), "stage {} serialized empty", s.stage_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_no_stage_markers_is_rejected() {
+        // no RayStageOptimizerRule, so no DFRayStageExec markers are inserted
+        let plain = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let plan = plan_for(&plain, "select 1 as a").await;
+        match build_stages(plan, 8192, 0, None) {
+            Err(e) => assert!(e.to_string().contains("No stages found"), "got: {e}"),
+            Ok((stages, _)) => panic!("expected an error, got {} stages", stages.len()),
         }
     }
 }

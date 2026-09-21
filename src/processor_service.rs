@@ -20,6 +20,8 @@ use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::sync::Arc;
 
+use crate::pyerr::PyDataFusionResult;
+use crate::pyerr::wait_for_future;
 use arrow::array::RecordBatch;
 use arrow_flight::FlightClient;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -28,8 +30,6 @@ use datafusion::common::internal_datafusion_err;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use crate::pyerr::PyDataFusionResult;
-use crate::pyerr::wait_for_future;
 use futures::{Stream, TryStreamExt};
 use local_ip_address::local_ip;
 use log::{debug, error, info, trace};

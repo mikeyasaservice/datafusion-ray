@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::pyerr::PyDataFusionResult;
+use crate::pyerr::wait_for_future;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionConfig, SessionContext};
-use crate::pyerr::PyDataFusionResult;
-use crate::pyerr::wait_for_future;
 use log::debug;
 use pyo3::prelude::*;
 use std::sync::Arc;

@@ -129,7 +129,12 @@ where
 }
 
 /// A physical plan handed back to Python for inspection.
-#[pyclass(name = "ExecutionPlan", module = "datafusion_ray", subclass, skip_from_py_object)]
+#[pyclass(
+    name = "ExecutionPlan",
+    module = "datafusion_ray",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Debug, Clone)]
 pub struct PyExecutionPlan {
     pub plan: Arc<dyn ExecutionPlan>,
@@ -171,7 +176,12 @@ impl PyExecutionPlan {
 }
 
 /// A logical plan handed back to Python for inspection.
-#[pyclass(name = "LogicalPlan", module = "datafusion_ray", subclass, skip_from_py_object)]
+#[pyclass(
+    name = "LogicalPlan",
+    module = "datafusion_ray",
+    subclass,
+    skip_from_py_object
+)]
 #[derive(Debug, Clone)]
 pub struct PyLogicalPlan {
     pub plan: Arc<LogicalPlan>,

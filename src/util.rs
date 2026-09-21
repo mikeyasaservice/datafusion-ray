@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::pyerr::PyDataFusionResult;
+use crate::pyerr::wait_for_future;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -31,8 +33,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_proto::physical_plan::AsExecutionPlan;
-use crate::pyerr::PyDataFusionResult;
-use crate::pyerr::wait_for_future;
 use futures::{Stream, StreamExt};
 use log::debug;
 use object_store::ObjectStore;
