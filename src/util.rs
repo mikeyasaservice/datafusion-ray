@@ -826,7 +826,8 @@ mod test {
         let env = ctx.runtime_env();
         for url in ["s3://bucket/", "gs://bucket/", "https://example.com/"] {
             assert!(
-                env.object_store(ObjectStoreUrl::parse(url).unwrap()).is_ok(),
+                env.object_store(ObjectStoreUrl::parse(url).unwrap())
+                    .is_ok(),
                 "{url} was not registered"
             );
         }
@@ -974,7 +975,10 @@ mod test {
 
             let back = ipc_to_batch(&raw, py).unwrap();
             assert_eq!(
-                back.getattr("num_rows").unwrap().extract::<usize>().unwrap(),
+                back.getattr("num_rows")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
                 3
             );
 

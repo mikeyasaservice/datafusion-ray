@@ -330,4 +330,96 @@ mod test {
             );
         }
     }
+
+    /// Every node in a stage arrives as bytes with its children already
+    /// decoded. A count the node cannot use has to be reported, because the
+    /// alternative is a plan that is silently wrong on a remote processor.
+    #[test]
+    fn a_node_that_needs_one_input_rejects_the_wrong_number() {
+        let ctx = SessionContext::new();
+        let codec = RayCodec {};
+        let converter = DefaultPhysicalProtoConverter {};
+
+        let mut buf = vec![];
+        PartitionIsolatorExecNode {
+            dummy: 0.0,
+            partition_count: 2,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        match codec.try_decode(&buf, &[], &ctx.task_ctx(), &converter) {
+            Err(e) => assert!(e.to_string().contains("requires one input"), "got: {e}"),
+            Ok(p) => panic!("expected an error, decoded {}", p.name()),
+        }
+
+        let mut buf = vec![];
+        MaxRowsExecNode { max_rows: 10 }.encode(&mut buf).unwrap();
+        match codec.try_decode(&buf, &[], &ctx.task_ctx(), &converter) {
+            Err(e) => assert!(e.to_string().contains("requires one input"), "got: {e}"),
+            Ok(p) => panic!("expected an error, decoded {}", p.name()),
+        }
+    }
+
+    /// A reader carries the schema and partitioning of the stage it consumes;
+    /// neither can be reconstructed if it is missing from the wire.
+    #[test]
+    fn a_reader_without_its_schema_or_partitioning_is_rejected() {
+        let ctx = SessionContext::new();
+        let codec = RayCodec {};
+        let converter = DefaultPhysicalProtoConverter {};
+
+        let schema: protobuf::Schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", DataType::Int32, false),
+        ]))
+        .try_into()
+        .unwrap();
+        let partitioning =
+            serialize_partitioning(&Partitioning::UnknownPartitioning(1), &codec, &converter)
+                .unwrap();
+
+        let mut buf = vec![];
+        DfRayStageReaderExecNode {
+            schema: None,
+            partitioning: Some(partitioning),
+            stage_id: 1,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        match codec.try_decode(&buf, &[], &ctx.task_ctx(), &converter) {
+            Err(e) => assert!(e.to_string().contains("missing schema"), "got: {e}"),
+            Ok(p) => panic!("expected an error, decoded {}", p.name()),
+        }
+
+        let mut buf = vec![];
+        DfRayStageReaderExecNode {
+            schema: Some(schema),
+            partitioning: None,
+            stage_id: 1,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        match codec.try_decode(&buf, &[], &ctx.task_ctx(), &converter) {
+            Err(e) => assert!(e.to_string().contains("missing partitioning"), "got: {e}"),
+            Ok(p) => panic!("expected an error, decoded {}", p.name()),
+        }
+    }
+
+    /// The codec only knows this crate's four nodes; anything else must fail
+    /// loudly at encode time rather than travel as an empty buffer.
+    #[test]
+    fn an_unknown_node_cannot_be_encoded() {
+        let codec = RayCodec {};
+        let converter = DefaultPhysicalProtoConverter {};
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", DataType::Int32, false),
+        ]));
+        let node = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema))
+            as Arc<dyn ExecutionPlan>;
+
+        let mut buf = vec![];
+        match codec.try_encode(node, &mut buf, &converter) {
+            Err(e) => assert!(e.to_string().contains("Not supported"), "got: {e}"),
+            Ok(()) => panic!("EmptyExec is not one of ours; expected an error"),
+        }
+    }
 }

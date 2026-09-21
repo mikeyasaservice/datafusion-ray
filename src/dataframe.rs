@@ -797,9 +797,7 @@ mod test {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
-    fn py_stream(
-        batches: Vec<Result<RecordBatch, DataFusionError>>,
-    ) -> PyRecordBatchStream {
+    fn py_stream(batches: Vec<Result<RecordBatch, DataFusionError>>) -> PyRecordBatchStream {
         let schema = int_batch().schema();
         PyRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -825,7 +823,11 @@ mod test {
         Python::attach(|py| {
             let first = s.next(py).unwrap();
             assert_eq!(
-                first.getattr("num_rows").unwrap().extract::<usize>().unwrap(),
+                first
+                    .getattr("num_rows")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
                 3
             );
             let err = s.__next__(py).unwrap_err();
@@ -860,5 +862,66 @@ mod test {
             let err = bound.call_method0("__anext__").unwrap_err();
             assert!(err.to_string().contains("loop"), "got: {err}");
         });
+    }
+
+    /// A nested loop join materializes its whole left side, so it cannot be
+    /// split across processors: it gets a stage to itself whose single
+    /// partition group covers every partition.
+    #[test]
+    fn a_nested_loop_join_gets_a_whole_stage_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(3);
+        let plan = get_tokio_runtime().block_on(async {
+            with_table(&c, dir.path()).await;
+            // a non-equi predicate is what forces a nested loop join
+            plan_for(
+                &c,
+                "select count(*) from t x join t y on x.a > y.a order by 1",
+            )
+            .await
+        });
+        assert!(
+            displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("NestedLoopJoinExec"),
+            "fixture did not produce a nested loop join"
+        );
+
+        // prefetch on, so the buffering branch is taken too
+        let (stages, _) = build_stages(plan, 8192, 2, Some(2)).unwrap();
+
+        let joined = stages
+            .iter()
+            .find(|s| {
+                displayable(s.plan.as_ref())
+                    .indent(false)
+                    .to_string()
+                    .contains("NestedLoopJoinExec")
+            })
+            .expect("the join should have landed in a stage");
+
+        assert!(
+            joined.full_partitions,
+            "the join stage hosts complete partitions"
+        );
+        assert_eq!(
+            joined.partition_groups.len(),
+            1,
+            "the join must not be split across processors: {:?}",
+            joined.partition_groups
+        );
+        assert_eq!(
+            joined.partition_groups[0].len(),
+            joined.num_output_partitions(),
+            "the single group covers every partition"
+        );
+        assert!(
+            displayable(joined.plan.as_ref())
+                .indent(false)
+                .to_string()
+                .contains("PrefetchExec"),
+            "a non-zero prefetch buffer should have been inserted"
+        );
     }
 }

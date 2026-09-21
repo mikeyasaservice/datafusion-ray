@@ -69,12 +69,28 @@ fn setup_logging() {
 mod test {
     use super::*;
 
-    /// `env_logger` panics if a logger is already installed, so this is the
-    /// only place in the test binary that may install one.
+    /// Everything python can reach goes through this one function, so a class
+    /// dropped from it disappears silently. `setup_logging` runs here too:
+    /// `env_logger` panics if a logger is already installed, which is why this
+    /// is the only test in the binary that may install one.
     #[test]
-    fn logging_is_wired_up_once() {
-        Python::attach(|_py| setup_logging());
-        log::debug!("logging initialised");
+    fn the_module_exports_everything_python_imports() {
+        Python::attach(|py| {
+            let m = pyo3::wrap_pymodule!(_datafusion_ray_internal)(py);
+            let m = m.bind(py);
+            for name in [
+                "DFRayContext",
+                "DFRayDataFrame",
+                "PyDFRayStage",
+                "DFRayProcessorService",
+                "LocalValidator",
+                "ExecutionPlan",
+                "LogicalPlan",
+                "prettify",
+            ] {
+                assert!(m.hasattr(name).unwrap(), "{name} is not exported");
+            }
+        });
+        log::debug!("logging is initialised");
     }
 }
-

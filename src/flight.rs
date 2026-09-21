@@ -164,8 +164,9 @@ mod test {
     /// Only `do_get` is part of the stage protocol. The rest of the Flight
     /// surface must refuse clearly rather than half-answer.
     ///
-    /// `handshake`, `do_put` and `do_exchange` are omitted: they take
-    /// `tonic::Streaming`, which cannot be built outside a real connection.
+    /// `handshake`, `do_put` and `do_exchange` take `tonic::Streaming`, which
+    /// cannot be built outside a real connection, so they are refused over a
+    /// real socket in `the_streaming_methods_are_refused_over_a_connection`.
     #[tokio::test]
     async fn every_other_flight_method_is_refused() {
         let s = serv();
@@ -204,5 +205,46 @@ mod test {
             s.list_actions(Request::new(Empty::default())),
             "list_actions"
         );
+    }
+
+    #[tokio::test]
+    async fn the_streaming_methods_are_refused_over_a_connection() {
+        use arrow_flight::flight_service_server::FlightServiceServer;
+        use tokio::net::TcpListener;
+        use tonic::transport::Server;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(serv()))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+        });
+
+        let mut client = crate::util::make_client(&addr).await.unwrap();
+
+        let empty = || futures::stream::iter(Vec::<arrow_flight::error::Result<FlightData>>::new());
+        match client.handshake(vec![1, 2, 3]).await {
+            Err(e) => assert!(e.to_string().contains("handshake"), "got: {e}"),
+            Ok(_) => panic!("handshake unexpectedly succeeded"),
+        }
+        match client.do_put(empty()).await {
+            Err(e) => assert!(e.to_string().contains("do put"), "got: {e}"),
+            Ok(_) => panic!("do_put unexpectedly succeeded"),
+        }
+        match client.do_exchange(empty()).await {
+            Err(e) => assert!(e.to_string().contains("do_exchange"), "got: {e}"),
+            Ok(_) => panic!("do_exchange unexpectedly succeeded"),
+        }
+
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
     }
 }

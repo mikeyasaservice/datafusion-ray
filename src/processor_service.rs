@@ -615,4 +615,148 @@ mod test {
     async fn connecting_to_a_bad_address_fails_cleanly() {
         assert!(crate::util::make_client("not a host:!!").await.is_err());
     }
+
+    /// Stand a stage up on a real socket. Returns its address and a shutdown
+    /// handle; dropping the sender stops the server.
+    async fn serve(
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let handler = Arc::new(handler_for(plan).await);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(FlightServ { handler }))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+        });
+        (addr, tx, join)
+    }
+
+    /// The consumer half of the same path: a `DFRayStageReaderExec` executed
+    /// against a live peer, which is how every stage but the first gets its
+    /// input and how the driver reads the last one.
+    #[tokio::test]
+    async fn a_reader_pulls_a_partition_from_a_live_stage() {
+        let (addr, shutdown, join) = serve(leaf_plan(2)).await;
+
+        let reader = Arc::new(
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(2), schema(), 0)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        // partition 1 of the fixture holds the single row `1`
+        let stream = crate::util::collect_from_stage(0, 1, &addr, reader)
+            .await
+            .unwrap();
+        let batches: Vec<_> = stream.collect::<Vec<_>>().await;
+        let rows: i32 = batches
+            .into_iter()
+            .map(|b| {
+                let b = b.unwrap();
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum();
+        assert_eq!(rows, 1, "partition 1 should have produced its own row");
+
+        let _ = shutdown.send(());
+        join.await.unwrap().unwrap();
+    }
+
+    /// A peer that goes away mid-query must surface as an error item on the
+    /// stream rather than an empty result that looks like success.
+    #[tokio::test]
+    async fn a_peer_that_has_gone_away_is_reported_on_the_stream() {
+        let (addr, shutdown, join) = serve(leaf_plan(1)).await;
+        let client = crate::util::make_client(&addr).await.unwrap();
+
+        // the connection is established; now take the server away
+        let _ = shutdown.send(());
+        join.await.unwrap().unwrap();
+
+        let mut client_map = HashMap::new();
+        client_map.insert((0, 0), Mutex::new(vec![client]));
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_extension(Arc::new(ServiceClients(client_map))),
+        );
+
+        let reader =
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(1), schema(), 0)
+                .unwrap();
+        let out: Vec<_> = reader
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Err(e) => assert!(
+                e.to_string().contains("Error getting flight stream"),
+                "got: {e}"
+            ),
+            Ok(b) => panic!("expected a failure, got {} rows", b.num_rows()),
+        }
+    }
+
+    /// The whole actor lifecycle as ray drives it: bind a socket, take a
+    /// serialized plan, serve it, and stop when told. `serve`, `all_done` and
+    /// `update_plan` all hand python a coroutine, so this drives them from a
+    /// real asyncio loop -- which is also the only way `future_into_py` has a
+    /// loop to attach to.
+    #[test]
+    fn the_service_binds_serves_a_plan_and_shuts_down() {
+        use pyo3::types::{PyBytes, PyModule};
+
+        let plan_bytes = crate::util::physical_plan_to_bytes(leaf_plan(1)).unwrap();
+
+        Python::attach(|py| {
+            let svc = Py::new(py, DFRayProcessorService::new("test".to_string()).unwrap()).unwrap();
+
+            // no socket yet
+            assert!(svc.borrow(py).addr().is_err());
+            svc.borrow_mut(py).start_up(py).unwrap();
+            let addr = svc.borrow(py).addr().unwrap();
+            assert!(addr.contains(':'), "got: {addr}");
+
+            let driver = PyModule::from_code(
+                py,
+                cr#"
+import asyncio
+
+def run(svc, plan_bytes):
+    async def main():
+        await svc.update_plan(0, {}, [0], plan_bytes)
+        serving = asyncio.ensure_future(svc.serve())
+        await asyncio.sleep(0.2)
+        await svc.all_done()
+        await serving
+    asyncio.run(main())
+"#,
+                cr"svc_driver.py",
+                cr"svc_driver",
+            )
+            .unwrap();
+
+            driver
+                .getattr("run")
+                .unwrap()
+                .call1((&svc, PyBytes::new(py, &plan_bytes)))
+                .unwrap();
+        });
+    }
 }
