@@ -97,3 +97,111 @@ impl PhysicalOptimizerRule for RayStageOptimizerRule {
         true
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    async fn optimized(sql: &str, target_partitions: usize) -> String {
+        let mut config = SessionConfig::new().with_target_partitions(target_partitions);
+        crate::util::apply_planning_settings(&mut config);
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(RayStageOptimizerRule::new()))
+            .with_config(config)
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        // registered directly rather than via CTAS: this context carries the
+        // rule under test, whose markers have an unimplemented execute, so it
+        // cannot run a query to build its own fixture
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("k", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from((1..=30).collect::<Vec<i32>>())),
+                Arc::new(Int32Array::from(
+                    (1..=30).map(|v| v % 3).collect::<Vec<i32>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        // several partitions so the planner has something to repartition
+        let table = MemTable::try_new(schema, vec![vec![batch.clone()], vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        displayable(plan.as_ref()).indent(true).to_string()
+    }
+
+    #[test]
+    fn rule_identifies_itself() {
+        let rule = RayStageOptimizerRule::new();
+        assert_eq!(rule.name(), "RayStageOptimizerRule");
+        assert!(rule.schema_check());
+        // Default and new agree
+        assert_eq!(RayStageOptimizerRule::default().name(), rule.name());
+    }
+
+    /// Every plan gets a marker at the root, because the driver always reads the
+    /// final stage over Flight.
+    #[tokio::test]
+    async fn a_trivial_plan_gets_exactly_one_stage() {
+        let shown = optimized("select 1 as a", 1).await;
+        assert_eq!(shown.matches("RayStageExec").count(), 1, "{shown}");
+        assert!(shown.starts_with("RayStageExec"), "{shown}");
+    }
+
+    /// Repartition and sort are network boundaries: data has to move between
+    /// processors there, so each one becomes its own stage.
+    #[tokio::test]
+    async fn repartition_and_sort_each_open_a_stage() {
+        let shown = optimized("select k, count(*) from t group by k order by k", 3).await;
+        let markers = shown.matches("RayStageExec").count();
+        assert!(
+            markers >= 3,
+            "expected a stage per boundary plus the root:\n{shown}"
+        );
+
+        // a marker sits directly above each boundary operator
+        for boundary in ["RepartitionExec", "SortExec"] {
+            assert!(shown.contains(boundary), "no {boundary} in:\n{shown}");
+        }
+    }
+
+    /// A scan-and-filter plan crosses no boundary, so it must not be split.
+    #[tokio::test]
+    async fn a_plan_with_no_boundary_is_not_split() {
+        let shown = optimized("select a from t where a > 5", 1).await;
+        assert_eq!(shown.matches("RayStageExec").count(), 1, "{shown}");
+    }
+
+    /// Stage ids are what the address map is keyed on, so they must be distinct.
+    #[tokio::test]
+    async fn stage_ids_are_unique() {
+        let shown = optimized("select k, count(*) from t group by k order by k", 3).await;
+        let mut ids: Vec<&str> = shown
+            .match_indices("RayStageExec[")
+            .map(|(i, _)| {
+                let rest = &shown[i + "RayStageExec[".len()..];
+                &rest[..rest.find(']').unwrap()]
+            })
+            .collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "duplicate stage ids in:\n{shown}");
+    }
+}

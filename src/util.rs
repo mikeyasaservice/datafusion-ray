@@ -621,6 +621,9 @@ pub(crate) fn maybe_register_object_store(
 
 #[cfg(test)]
 mod test {
+    use crate::max_rows::MaxRowsExec;
+    use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::empty::EmptyExec;
     use std::{sync::Arc, vec};
 
     use arrow::{
@@ -691,5 +694,184 @@ mod test {
         );
         apply_execution_settings(&mut config);
         assert!(!config.options().execution.enable_file_stream_work_stealing);
+    }
+
+    /// `CombinedRecordBatchStream` merges one partition's streams from every
+    /// processor hosting a stage. Its round-robin `poll_next` removes exhausted
+    /// entries with `swap_remove`, so the cursor arithmetic has to hold as the
+    /// vector shrinks under it.
+    fn batch(vals: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vals))]).unwrap()
+    }
+
+    fn stream_of(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+
+    fn int_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    async fn drain(mut s: SendableRecordBatchStream) -> Vec<i32> {
+        let mut out = vec![];
+        while let Some(b) = s.next().await {
+            let b = b.unwrap();
+            let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            out.extend(col.iter().flatten());
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn combined_stream_merges_every_entry() {
+        let s = CombinedRecordBatchStream::new(
+            int_schema(),
+            vec![
+                stream_of(vec![batch(vec![1, 2])]),
+                stream_of(vec![batch(vec![3])]),
+                stream_of(vec![batch(vec![4, 5, 6])]),
+            ],
+        );
+        assert_eq!(s.schema(), int_schema());
+        assert_eq!(drain(Box::pin(s)).await, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn combined_stream_handles_empty_and_exhausted_entries() {
+        // entries that finish at different points exercise the swap_remove path
+        let s = CombinedRecordBatchStream::new(
+            int_schema(),
+            vec![
+                stream_of(vec![]),
+                stream_of(vec![batch(vec![7])]),
+                stream_of(vec![]),
+                stream_of(vec![batch(vec![8, 9])]),
+            ],
+        );
+        assert_eq!(drain(Box::pin(s)).await, vec![7, 8, 9]);
+
+        let empty = CombinedRecordBatchStream::new(int_schema(), vec![]);
+        assert!(drain(Box::pin(empty)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn combined_stream_propagates_errors() {
+        let failing: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            int_schema(),
+            futures::stream::iter(vec![Err(internal_datafusion_err!("boom"))]),
+        ));
+        let mut s = CombinedRecordBatchStream::new(int_schema(), vec![failing]);
+        let got = s.next().await.unwrap();
+        assert!(got.unwrap_err().to_string().contains("boom"));
+    }
+
+    #[test]
+    fn ticket_round_trips_and_rejects_garbage() {
+        let ticket = Ticket {
+            ticket: FlightTicketData {
+                dummy: false,
+                partition: 7,
+            }
+            .encode_to_vec()
+            .into(),
+        };
+        assert_eq!(extract_ticket(ticket).unwrap(), 7);
+
+        let bad = Ticket {
+            ticket: vec![0xff, 0xff, 0xff].into(),
+        };
+        assert!(extract_ticket(bad).is_err());
+    }
+
+    #[test]
+    fn planning_settings_keep_partition_isolation_safe() {
+        // mirrors the execution-side guard: assert DataFusion's default first,
+        // so this fails if upstream changes it rather than silently passing
+        let mut config = SessionConfig::new();
+        let opts = config.options();
+        assert!(opts.optimizer.hash_join_single_partition_threshold > 0);
+        assert!(opts.optimizer.hash_join_single_partition_threshold_rows > 0);
+        assert!(opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+
+        apply_planning_settings(&mut config);
+        let opts = config.options();
+        assert_eq!(opts.optimizer.hash_join_single_partition_threshold, 0);
+        assert_eq!(opts.optimizer.hash_join_single_partition_threshold_rows, 0);
+        assert!(!opts.optimizer.enable_physical_uncorrelated_scalar_subquery);
+    }
+
+    #[test]
+    fn object_store_registration_covers_each_scheme() {
+        let ctx = SessionContext::new();
+        // local and http need no credentials
+        maybe_register_object_store(&ctx, &Url::parse("file:///tmp/x").unwrap()).unwrap();
+        maybe_register_object_store(&ctx, &Url::parse("http://example.com/x").unwrap()).unwrap();
+        maybe_register_object_store(&ctx, &Url::parse("https://example.com/x").unwrap()).unwrap();
+
+        // a scheme that carries no host cannot name a bucket
+        assert!(maybe_register_object_store(&ctx, &Url::parse("s3:///nohost").unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_display_reports_partition_counts_and_pushdown() {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        ctx.sql(&format!(
+            "copy (select v as a from generate_series(1, 10) t(v)) to '{}' stored as parquet",
+            path.display()
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        ctx.register_parquet(
+            "t",
+            path.to_str().unwrap(),
+            datafusion::prelude::ParquetReadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let plan = ctx
+            .sql("select a from t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let shown = display_plan_with_partition_counts(&plan).to_string();
+        assert!(shown.contains("output_partitions"));
+        assert!(shown.contains("DataSourceExec"));
+        assert!(shown.contains("pushdown filters:"), "got: {shown}");
+    }
+
+    #[tokio::test]
+    async fn input_stage_ids_finds_every_reader() {
+        let schema = int_schema();
+        let a = Arc::new(
+            DFRayStageReaderExec::try_new(Partitioning::UnknownPartitioning(1), schema.clone(), 3)
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        assert_eq!(input_stage_ids(&a).unwrap(), vec![3]);
+
+        let wrapped = Arc::new(MaxRowsExec::new(a, 10)) as Arc<dyn ExecutionPlan>;
+        assert_eq!(input_stage_ids(&wrapped).unwrap(), vec![3]);
+
+        let none = Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>;
+        assert!(input_stage_ids(&none).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_on_lag_returns_the_inner_value() {
+        assert_eq!(report_on_lag("quick", async { 42 }).await, 42);
     }
 }

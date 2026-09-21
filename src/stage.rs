@@ -175,3 +175,73 @@ impl ExecutionPlan for DFRayStageExec {
         unimplemented!("Ray Stage Exec")
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::{ExecutionPlanProperties, displayable};
+    use datafusion::prelude::SessionContext;
+
+    fn source(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let parts: Vec<Vec<RecordBatch>> = (0..partitions)
+            .map(|i| {
+                vec![
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![i as i32]))],
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect();
+        MemorySourceConfig::try_new_exec(&parts, schema, None).unwrap() as Arc<dyn ExecutionPlan>
+    }
+
+    #[test]
+    fn carries_its_stage_id_and_its_input_shape() {
+        let stage = Arc::new(DFRayStageExec::new(source(3), 7)) as Arc<dyn ExecutionPlan>;
+        assert_eq!(stage.name(), "RayStageExec");
+        assert_eq!(stage.children().len(), 1);
+        assert_eq!(stage.output_partitioning().partition_count(), 3);
+        assert_eq!(stage.schema().fields().len(), 1);
+
+        let shown = format!("{}", displayable(stage.as_ref()).one_line());
+        assert!(shown.contains("RayStageExec[7]"), "{shown}");
+    }
+
+    /// The marker keeps the partitioning it was created with even after the
+    /// tree around it is rewritten, because `DFRayStageReaderExec` is built
+    /// from it later and has to advertise the original shape.
+    #[test]
+    fn replacing_children_preserves_the_original_partitioning() {
+        let stage = Arc::new(DFRayStageExec::new(source(3), 1));
+        assert_eq!(
+            stage.properties().output_partitioning().partition_count(),
+            3
+        );
+
+        #[allow(deprecated)]
+        let replaced = stage.with_new_children(vec![source(1)]).unwrap();
+        assert_eq!(
+            replaced.output_partitioning().partition_count(),
+            3,
+            "a narrower child must not shrink the advertised partitioning"
+        );
+        assert!(
+            format!("{}", displayable(replaced.as_ref()).one_line()).contains("RayStageExec[1]")
+        );
+    }
+
+    /// The marker is consumed during stage splitting and never executed; Ray
+    /// runs the stages instead.
+    #[test]
+    #[should_panic(expected = "Ray Stage Exec")]
+    fn executing_the_marker_is_a_bug() {
+        let stage = Arc::new(DFRayStageExec::new(source(1), 0)) as Arc<dyn ExecutionPlan>;
+        let _ = stage.execute(0, SessionContext::new().task_ctx());
+    }
+}

@@ -117,3 +117,92 @@ impl FlightService for FlightServ {
         Err(Status::unimplemented("Unimplemented: do_exchange"))
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow_flight::Criteria;
+    use futures::StreamExt;
+
+    struct Echo;
+
+    #[tonic::async_trait]
+    impl FlightHandler for Echo {
+        async fn get_stream(
+            &self,
+            request: Request<Ticket>,
+        ) -> Result<Response<DoGetStream>, Status> {
+            let bytes = request.into_inner().ticket;
+            let out = futures::stream::once(async move {
+                Ok(FlightData {
+                    data_header: bytes,
+                    ..Default::default()
+                })
+            });
+            Ok(Response::new(Box::pin(out) as DoGetStream))
+        }
+    }
+
+    fn serv() -> FlightServ {
+        FlightServ {
+            handler: Arc::new(Echo),
+        }
+    }
+
+    #[tokio::test]
+    async fn do_get_delegates_to_the_handler() {
+        let resp = serv()
+            .do_get(Request::new(Ticket {
+                ticket: vec![1, 2, 3].into(),
+            }))
+            .await
+            .unwrap();
+        let got = resp.into_inner().next().await.unwrap().unwrap();
+        assert_eq!(got.data_header.as_ref(), &[1, 2, 3]);
+    }
+
+    /// Only `do_get` is part of the stage protocol. The rest of the Flight
+    /// surface must refuse clearly rather than half-answer.
+    ///
+    /// `handshake`, `do_put` and `do_exchange` are omitted: they take
+    /// `tonic::Streaming`, which cannot be built outside a real connection.
+    #[tokio::test]
+    async fn every_other_flight_method_is_refused() {
+        let s = serv();
+
+        macro_rules! refused {
+            ($call:expr, $name:literal) => {
+                match $call.await {
+                    Err(status) => assert_eq!(
+                        status.code(),
+                        tonic::Code::Unimplemented,
+                        concat!($name, " should be unimplemented")
+                    ),
+                    Ok(_) => panic!(concat!($name, " unexpectedly succeeded")),
+                }
+            };
+        }
+
+        refused!(
+            s.list_flights(Request::new(Criteria::default())),
+            "list_flights"
+        );
+        refused!(
+            s.get_flight_info(Request::new(FlightDescriptor::default())),
+            "get_flight_info"
+        );
+        refused!(
+            s.poll_flight_info(Request::new(FlightDescriptor::default())),
+            "poll_flight_info"
+        );
+        refused!(
+            s.get_schema(Request::new(FlightDescriptor::default())),
+            "get_schema"
+        );
+        refused!(s.do_action(Request::new(Action::default())), "do_action");
+        refused!(
+            s.list_actions(Request::new(Empty::default())),
+            "list_actions"
+        );
+    }
+}
