@@ -267,7 +267,9 @@ fn build_stages(
         .ok_or(internal_datafusion_err!("No stages found"))?;
 
     if last_stage.num_output_partitions() > 1 {
-        return Err(internal_datafusion_err!("Last stage expected to have one partition").into());
+        return Err(internal_datafusion_err!(
+            "Last stage expected to have one partition"
+        ));
     }
 
     last_stage = PyDFRayStage::new(

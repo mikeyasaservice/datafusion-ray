@@ -31,6 +31,57 @@ env:
   MATURIN_PEP517_ARGS: --profile=dev
 
 jobs:
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
+        with:
+          components: clippy, llvm-tools-preview
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.4"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The tests link libpython (the `extension-module` feature is off for
+      # them, see Cargo.toml) and the ones that hand a batch to python need
+      # pyarrow importable by *this* interpreter, not merely by the project's
+      # virtualenv.
+      - name: Install pyarrow for the embedded interpreter
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyarrow
+          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo
+          key: cargo-test-cache-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --all-targets -- -Dclippy::all -Aclippy::redundant_closure
+
+      - name: Test
+        run: cargo test --no-default-features
+
+      # Line coverage of production code only: test modules live inside the
+      # files they cover, and llvm-cov counts them as covered, so a gate on
+      # the headline number could be satisfied by test code counting itself.
+      - name: Production coverage
+        run: python dev/coverage.py --fail-under 85
+
   validate-tpch:
     runs-on: ${{ matrix.platform.image }}
     strategy:
