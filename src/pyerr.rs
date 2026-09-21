@@ -258,4 +258,40 @@ mod test {
             assert!(py_err.to_string().contains("boom"));
         });
     }
+
+    /// `wait_for_future` polls for signals once a second so a long query stays
+    /// interruptible from python. A future that outlives one poll is the only
+    /// thing that exercises that arm.
+    #[test]
+    fn a_slow_future_is_polled_for_signals_and_still_returns() {
+        Python::attach(|py| {
+            let out = wait_for_future(py, async {
+                sleep(Duration::from_millis(1_200)).await;
+                "done"
+            })
+            .unwrap();
+            assert_eq!(out, "done");
+        });
+    }
+
+    #[test]
+    fn every_error_variant_renders_and_crosses_the_boundary() {
+        Python::attach(|py| {
+            let arrow = PyDataFusionError::from(ArrowError::IpcError("bad ipc".into()));
+            assert!(arrow.to_string().contains("bad ipc"));
+            assert!(PyErr::from(arrow).to_string().contains("bad ipc"));
+
+            let common = PyDataFusionError::Common("plain".into());
+            assert_eq!(common.to_string(), "plain");
+            assert!(PyErr::from(common).to_string().contains("plain"));
+
+            // a python error passes through unchanged rather than being
+            // re-wrapped, so `except KeyError` still works on the far side
+            let original = PyErr::new::<pyo3::exceptions::PyKeyError, _>("missing");
+            let wrapped = PyDataFusionError::from(original);
+            assert!(wrapped.to_string().contains("missing"));
+            let back: PyErr = wrapped.into();
+            assert!(back.is_instance_of::<pyo3::exceptions::PyKeyError>(py));
+        });
+    }
 }

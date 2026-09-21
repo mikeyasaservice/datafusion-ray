@@ -707,4 +707,158 @@ mod test {
             Ok((stages, _)) => panic!("expected an error, got {} stages", stages.len()),
         }
     }
+
+    // ------------------------------------------------------------------
+    // The Python-facing surface.
+    //
+    // `wait_for_future` drives futures on the crate's global tokio runtime,
+    // and `block_on` cannot be called from inside another runtime, so these
+    // are plain `#[test]`s that build their fixtures with `block_on` rather
+    // than `#[tokio::test]`s.
+    // ------------------------------------------------------------------
+
+    use crate::pyerr::get_tokio_runtime;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    fn ray_df(sql: &str) -> (tempfile::TempDir, DFRayDataFrame) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx(3);
+        let df = get_tokio_runtime().block_on(async {
+            with_table(&c, dir.path()).await;
+            c.sql(sql).await.unwrap()
+        });
+        (dir, DFRayDataFrame::new(df))
+    }
+
+    #[test]
+    fn the_plan_accessors_render_the_query_python_asks_about() {
+        let (_dir, df) = ray_df("select k, count(*) from t group by k order by k");
+        Python::attach(|py| {
+            let physical = df.execution_plan(py).unwrap();
+            assert!(
+                physical.display_indent().contains("RayStageExec"),
+                "got: {}",
+                physical.display_indent()
+            );
+
+            let shown = df.display_execution_plan(py).unwrap();
+            assert!(shown.contains("output_partitions"), "got: {shown}");
+
+            let logical = df.logical_plan().unwrap();
+            assert!(logical.display_indent().contains("Aggregate"));
+            assert!(logical.display_indent_schema().contains("k"));
+            assert!(!logical.display().is_empty());
+            assert!(!logical.plan().schema().fields().is_empty());
+
+            let optimized = df.optimized_logical_plan().unwrap();
+            assert!(optimized.display_indent().contains("Aggregate"));
+
+            let schema = df.schema(py).unwrap();
+            assert!(schema.to_string().contains('k'), "got: {schema}");
+        });
+    }
+
+    /// `stages()` is the pymethod wrapper over `build_stages`: it must both
+    /// hand the stages back and keep the reader plan `read_final_stage` needs.
+    #[test]
+    fn stages_hands_back_the_stages_and_keeps_the_reader_plan() {
+        let (_dir, mut df) = ray_df("select k, count(*) from t group by k order by k");
+        Python::attach(|py| {
+            assert!(df.final_plan.is_none());
+            let stages = df.stages(py, 8192, 0, Some(2)).unwrap();
+            assert!(stages.len() >= 2);
+            assert!(df.final_plan.is_some(), "stages() records the reader plan");
+
+            // the accessors python reads off each stage
+            let last = stages.last().unwrap();
+            assert!(last.child_stage_ids().unwrap().len() <= stages.len());
+            assert!(
+                last.execution_plan()
+                    .display_indent()
+                    .contains("RayStageReaderExec")
+            );
+            assert!(
+                last.display_execution_plan()
+                    .unwrap()
+                    .contains("output_partitions")
+            );
+            assert!(!last.plan_bytes().unwrap().is_empty());
+
+            // the first stage reads files, not another stage
+            assert!(stages[0].child_stage_ids().unwrap().is_empty());
+        });
+    }
+
+    fn int_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap()
+    }
+
+    fn py_stream(
+        batches: Vec<Result<RecordBatch, DataFusionError>>,
+    ) -> PyRecordBatchStream {
+        let schema = int_batch().schema();
+        PyRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches),
+        )))
+    }
+
+    #[test]
+    fn a_batch_crosses_into_pyarrow() {
+        let batch: PyRecordBatch = int_batch().into();
+        Python::attach(|py| {
+            let obj = batch.to_pyarrow(py).unwrap();
+            assert_eq!(
+                obj.getattr("num_rows").unwrap().extract::<usize>().unwrap(),
+                3
+            );
+        });
+    }
+
+    #[test]
+    fn a_stream_iterates_then_raises_stop_iteration() {
+        let mut s = py_stream(vec![Ok(int_batch())]);
+        Python::attach(|py| {
+            let first = s.next(py).unwrap();
+            assert_eq!(
+                first.getattr("num_rows").unwrap().extract::<usize>().unwrap(),
+                3
+            );
+            let err = s.__next__(py).unwrap_err();
+            assert!(
+                err.is_instance_of::<PyStopIteration>(py),
+                "exhaustion must end a for loop, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_stream_error_surfaces_as_a_python_exception() {
+        let mut s = py_stream(vec![Err(DataFusionError::Internal("boom".into()))]);
+        Python::attach(|py| {
+            let err = s.next(py).unwrap_err();
+            assert!(err.to_string().contains("boom"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn a_stream_is_its_own_iterator() {
+        Python::attach(|py| {
+            let obj = Py::new(py, py_stream(vec![])).unwrap();
+            let bound = obj.bind(py);
+            for dunder in ["__iter__", "__aiter__"] {
+                let same = bound.call_method0(dunder).unwrap();
+                assert!(same.is(bound), "{dunder} must return self");
+            }
+
+            // no asyncio loop runs inside a rust test, so the async arm can
+            // only report that -- but it is the same line python awaits.
+            let err = bound.call_method0("__anext__").unwrap_err();
+            assert!(err.to_string().contains("loop"), "got: {err}");
+        });
+    }
 }

@@ -64,3 +64,17 @@ fn setup_logging() {
         .parse_filters(&combined_env)
         .init();
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `env_logger` panics if a logger is already installed, so this is the
+    /// only place in the test binary that may install one.
+    #[test]
+    fn logging_is_wired_up_once() {
+        Python::attach(|_py| setup_logging());
+        log::debug!("logging initialised");
+    }
+}
+

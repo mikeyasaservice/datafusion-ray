@@ -809,13 +809,36 @@ mod test {
     #[test]
     fn object_store_registration_covers_each_scheme() {
         let ctx = SessionContext::new();
-        // local and http need no credentials
-        maybe_register_object_store(&ctx, &Url::parse("file:///tmp/x").unwrap()).unwrap();
-        maybe_register_object_store(&ctx, &Url::parse("http://example.com/x").unwrap()).unwrap();
-        maybe_register_object_store(&ctx, &Url::parse("https://example.com/x").unwrap()).unwrap();
+        // none of these open a connection, so no credentials are needed
+        for url in [
+            "file:///tmp/x",
+            "http://example.com/x",
+            "https://example.com/x",
+            "s3://bucket/k",
+            "gs://bucket/k",
+            "gcs://bucket/k",
+        ] {
+            maybe_register_object_store(&ctx, &Url::parse(url).unwrap())
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
 
-        // a scheme that carries no host cannot name a bucket
-        assert!(maybe_register_object_store(&ctx, &Url::parse("s3:///nohost").unwrap()).is_err());
+        // and each one is reachable afterwards under its own url
+        let env = ctx.runtime_env();
+        for url in ["s3://bucket/", "gs://bucket/", "https://example.com/"] {
+            assert!(
+                env.object_store(ObjectStoreUrl::parse(url).unwrap()).is_ok(),
+                "{url} was not registered"
+            );
+        }
+
+        // a bucket scheme that carries no host cannot name a bucket
+        // (http is not in this list: url gives it an empty host rather than none)
+        for url in ["s3:///nohost", "gs:///nohost"] {
+            assert!(
+                maybe_register_object_store(&ctx, &Url::parse(url).unwrap()).is_err(),
+                "{url} should not have produced a store"
+            );
+        }
     }
 
     #[tokio::test]
@@ -873,5 +896,163 @@ mod test {
     #[tokio::test]
     async fn report_on_lag_returns_the_inner_value() {
         assert_eq!(report_on_lag("quick", async { 42 }).await, 42);
+    }
+
+    /// Processors receive a serialized plan and must register a store for
+    /// every path it scans before they can execute it.
+    #[tokio::test]
+    async fn stores_are_registered_for_every_scan_in_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        let writer = SessionContext::new();
+        writer
+            .sql(&format!(
+                "copy (select v as a from generate_series(1, 4) t(v)) to '{}' stored as parquet",
+                path.display()
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        writer
+            .register_parquet(
+                "t",
+                path.to_str().unwrap(),
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .unwrap();
+        let plan = writer
+            .sql("select a from t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // the scan is the root here, so wrap it: the walk inspects children
+        let wrapped = Arc::new(MaxRowsExec::new(plan, 10)) as Arc<dyn ExecutionPlan>;
+        let fresh = SessionContext::new();
+        register_object_store_for_paths_in_plan(&fresh, wrapped).unwrap();
+        assert!(
+            fresh
+                .runtime_env()
+                .object_store(ObjectStoreUrl::parse("file://").unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn to_py_err_passes_values_through_and_wraps_failures() {
+        Python::attach(|py| {
+            let ok: Result<usize, String> = Ok(7);
+            assert_eq!(ok.to_py_err().unwrap(), 7);
+
+            let bad: Result<usize, String> = Err("no good".to_string());
+            let err = bad.to_py_err().unwrap_err();
+            assert!(err.to_string().contains("no good"), "got: {err}");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyException>(py));
+        });
+    }
+
+    /// The ipc pyfunctions exist so batches cross to python without pyarrow's
+    /// C++ writer, which produces unaligned buffers we cannot read back.
+    #[test]
+    fn the_ipc_pyfunctions_round_trip_a_batch_through_python() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        Python::attach(|py| {
+            let bytes = batch_to_ipc(py, PyArrowType(batch.clone())).unwrap();
+            let bound = bytes.bind(py);
+            let raw: Vec<u8> = bound.extract().unwrap();
+            assert!(!raw.is_empty());
+
+            let back = ipc_to_batch(&raw, py).unwrap();
+            assert_eq!(
+                back.getattr("num_rows").unwrap().extract::<usize>().unwrap(),
+                3
+            );
+
+            // garbage in is an exception, not a panic
+            assert!(ipc_to_batch(b"not ipc at all", py).is_err());
+        });
+    }
+
+    #[test]
+    fn prettify_formats_batches_and_rejects_non_batches() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+
+        Python::attach(|py| {
+            let list = PyList::new(py, [batch.to_pyarrow(py).unwrap()]).unwrap();
+            let table = prettify(list).unwrap();
+            assert!(table.contains('a'), "got: {table}");
+            assert!(table.contains('1') && table.contains('2'), "got: {table}");
+
+            let not_batches = PyList::new(py, [1i32, 2]).unwrap();
+            assert!(prettify(not_batches).is_err());
+        });
+    }
+
+    /// `LocalValidator` is the single-process context the test harness compares
+    /// distributed answers against, so it has to produce the same rows.
+    #[test]
+    fn local_validator_answers_a_query_over_registered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.parquet");
+        crate::pyerr::get_tokio_runtime().block_on(async {
+            let writer = SessionContext::new();
+            writer
+                .sql(&format!(
+                    "copy (select v as a from generate_series(1, 5) t(v)) to '{}' \
+                     stored as parquet",
+                    path.display()
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        });
+
+        let mut v = LocalValidator::new();
+        Python::attach(|py| {
+            v.register_parquet(py, "p".into(), path.display().to_string())
+                .unwrap();
+            v.register_listing_table(py, "l", dir.path().to_str().unwrap(), ".parquet")
+                .unwrap();
+
+            for table in ["p", "l"] {
+                let batches = v
+                    .collect_sql(py, format!("select sum(a) as s from {table}"))
+                    .unwrap();
+                let rendered = prettify(batches.bind(py).cast().unwrap().clone()).unwrap();
+                assert!(rendered.contains("15"), "{table}: {rendered}");
+            }
+
+            match v.collect_sql(py, "select * from nowhere".into()) {
+                Ok(_) => panic!("expected an error for an unregistered table"),
+                Err(e) => assert!(e.to_string().contains("nowhere"), "got: {e}"),
+            }
+            assert!(
+                v.register_parquet(py, "x".into(), "/nonexistent/x.parquet".into())
+                    .is_err()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_lag_reporting_stream_passes_its_items_through() {
+        let items = stream::iter(vec![1, 2, 3]);
+        let out: Vec<i32> = lag_reporting_stream("test", items).collect().await;
+        assert_eq!(out, vec![1, 2, 3]);
     }
 }
